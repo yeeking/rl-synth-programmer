@@ -36,6 +36,7 @@ class CliLoggingOptionsTest(unittest.TestCase):
         self.assertEqual(args.updates_per_tick, 1)
         self.assertIsNone(args.clap_batch_size)
         self.assertIsNone(args.epsilon_decay_steps)
+        self.assertIsNone(args.max_episode_steps)
 
     def test_train_parser_accepts_epsilon_decay_steps(self) -> None:
         parser = _base_parser()
@@ -51,6 +52,21 @@ class CliLoggingOptionsTest(unittest.TestCase):
             ]
         )
         self.assertEqual(args.epsilon_decay_steps, 50000)
+
+    def test_train_parser_accepts_max_episode_steps(self) -> None:
+        parser = _base_parser()
+        args = parser.parse_args(
+            [
+                "train-dqn",
+                "--plugin",
+                "/tmp/test.vst3",
+                "--run-folder",
+                "artifacts/test_run",
+                "--max-episode-steps",
+                "48",
+            ]
+        )
+        self.assertEqual(args.max_episode_steps, 48)
 
     def test_smoke_train_parser_accepts_disable_flags(self) -> None:
         parser = _base_parser()

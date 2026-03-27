@@ -37,13 +37,20 @@ rl-synth train-dqn \
   --run-folder "artifacts/kr106_real" \
   --reward-mode clap \
   --steps 20000 \
-  --epsilon-decay-steps 50000
+  --epsilon-decay-steps 50000 \
+  --max-episode-steps 48
 
 rl-synth evaluate \
   --plugin "/home/matthew/.vst3/Ultramaster KR-106.vst3" \
   --run-folder "artifacts/kr106_real" \
   --episodes 16
 ```
+
+Current training behavior:
+
+- manifest-backed episodes start from another preset in the target set when possible, rather than from a full-random parameter vector
+- `--epsilon-decay-steps` controls epsilon decay over action steps
+- `--num-workers > 1` enables batched parallel rollout
 
 Verified 4-worker batched smoke:
 
@@ -109,6 +116,13 @@ Useful parallel options:
 Useful exploration option:
 
 - `--epsilon-decay-steps`: number of action steps over which epsilon decays; the current scheduler is step-based, not episode-based
+- `--max-episode-steps`: maximum number of actions per episode before truncation
+
+Recent KR-106 throughput check after switching reset starts from random parameters to other presets:
+
+- `--num-workers 1`: about `1.31` steps/s
+- `--num-workers 4`: about `1.82` steps/s
+- `--num-workers 8`: about `1.90` steps/s
 
 ## TensorBoard
 

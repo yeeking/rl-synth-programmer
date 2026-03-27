@@ -167,6 +167,12 @@ def _base_parser() -> argparse.ArgumentParser:
         default=None,
         help="Number of action steps over which epsilon decays from epsilon_start to epsilon_end. The current scheduler is step-based, not episode-based. Expected range: integer >= 1. If omitted, the config default is used.",
     )
+    train_parser.add_argument(
+        "--max-episode-steps",
+        type=int,
+        default=None,
+        help="Maximum actions allowed within one episode before truncation. Expected range: integer >= 1. If omitted, the config default is used.",
+    )
 
     eval_parser = subparsers.add_parser("evaluate", help="Evaluate the latest DQN checkpoint from a run folder.")
     eval_parser.add_argument(
@@ -498,6 +504,7 @@ def _experiment_config(
     clap_batch_size: int | None = None,
     clap_batch_timeout_ms: int = 10,
     epsilon_decay_steps: int | None = None,
+    max_episode_steps: int | None = None,
 ) -> ExperimentConfig:
     artifact_root = artifacts_dir or ARTIFACTS_ROOT / "default"
     host = SynthHostConfig(plugin_path=Path(plugin_path))
@@ -508,6 +515,8 @@ def _experiment_config(
         target_mode="preset_manifest" if manifest_path else "synthetic_pool",
         artifacts_dir=artifact_root,
     )
+    if max_episode_steps is not None:
+        env.max_episode_steps = int(max_episode_steps)
     curriculum = CurriculumConfig(manifest_path=manifest_path)
     resolved_clap_batch_size = num_workers if clap_batch_size is None else clap_batch_size
     dqn = DQNConfig()
@@ -570,6 +579,7 @@ def _cmd_train_dqn(
     updates_per_tick: int,
     clap_batch_size: int | None,
     epsilon_decay_steps: int | None,
+    max_episode_steps: int | None,
 ) -> None:
     run_root = _resolve_run_folder(run_folder, create=True)
     manifest_path = _find_manifest(run_root)
@@ -585,6 +595,7 @@ def _cmd_train_dqn(
         updates_per_tick=updates_per_tick,
         clap_batch_size=clap_batch_size,
         epsilon_decay_steps=epsilon_decay_steps,
+        max_episode_steps=max_episode_steps,
     )
     resolved_tensorboard_dir = _resolve_tensorboard_dir(run_root, "train-dqn", tensorboard_dir)
     checkpoint_path = train_dir / "dqn_latest.pt"
@@ -664,6 +675,7 @@ def main() -> None:
             args.updates_per_tick,
             args.clap_batch_size,
             args.epsilon_decay_steps,
+            args.max_episode_steps,
         )
     elif args.command == "evaluate":
         _cmd_evaluate(
