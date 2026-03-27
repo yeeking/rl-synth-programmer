@@ -36,7 +36,8 @@ rl-synth train-dqn \
   --plugin "/home/matthew/.vst3/Ultramaster KR-106.vst3" \
   --run-folder "artifacts/kr106_real" \
   --reward-mode clap \
-  --steps 20000
+  --steps 20000 \
+  --epsilon-decay-steps 50000
 
 rl-synth evaluate \
   --plugin "/home/matthew/.vst3/Ultramaster KR-106.vst3" \
@@ -104,6 +105,10 @@ Useful parallel options:
 - `--num-workers`: number of synth-render worker processes and active episode slots
 - `--updates-per-tick`: learner updates after each rollout batch
 - `--clap-batch-size`: number of audio buffers embedded together by CLAP; if omitted it defaults to `--num-workers`
+
+Useful exploration option:
+
+- `--epsilon-decay-steps`: number of action steps over which epsilon decays; the current scheduler is step-based, not episode-based
 
 ## TensorBoard
 
