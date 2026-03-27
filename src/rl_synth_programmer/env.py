@@ -129,27 +129,52 @@ class SynthProgrammingEnv(gym.Env):
                 self.host.restore_preset_state(previous_state)
         return target.embedding
 
+    def _preset_start_candidates(self, target: TargetSpec) -> list[TargetSpec]:
+        same_split = [
+            candidate
+            for candidate in self.curriculum.all_targets()
+            if candidate.target_id != target.target_id
+            and candidate.preset_state_path
+            and candidate.split == target.split
+        ]
+        if same_split:
+            return same_split
+        return [
+            candidate
+            for candidate in self.curriculum.all_targets()
+            if candidate.target_id != target.target_id and candidate.preset_state_path
+        ]
+
+    def _sample_initial_state(self, target: TargetSpec) -> tuple[dict[str, float], bytes | None]:
+        preset_candidates = self._preset_start_candidates(target)
+        if preset_candidates:
+            start_target = preset_candidates[int(self._rng.integers(0, len(preset_candidates)))]
+            return dict(start_target.parameters), Path(start_target.preset_state_path).read_bytes()
+        return self._sample_initial_params(), None
+
     def _sample_initial_params(self) -> dict[str, float]:
-        params = dict(self.host.get_normalized_defaults(self.parameter_specs))
-        for index, spec in enumerate(self.parameter_specs[: min(6, len(self.parameter_specs))]):
-            # Deterministically move away from defaults without relying on random full-range starts.
-            direction = 1.0 if index % 2 == 0 else -1.0
-            scale = (index + 1) * self.config.action_step
-            params[spec.stable_id] = float(np.clip(params[spec.stable_id] + direction * scale, 0.0, 1.0))
-        return params
+        return {
+            spec.stable_id: float(self._rng.uniform(0.0, 1.0))
+            for spec in self.parameter_specs
+        }
 
     def reset(self, *, seed: int | None = None, options: dict[str, Any] | None = None):
         if seed is not None:
             self._rng = np.random.default_rng(seed)
         _ = options
         self._current_target = self.curriculum.maybe_advance()
-        self._current_params = self._sample_initial_params()
         target_embedding = self._target_embedding(self._current_target)
-        self.host.set_parameters(self._current_params, self.parameter_specs)
-        audio = self._render_current_audio()
+        self._current_params, initial_preset_state = self._sample_initial_state(self._current_target)
+        if initial_preset_state is not None:
+            self.host.restore_preset_state(initial_preset_state)
+            audio = self.host.render_note(None)
+        else:
+            self.host.set_parameters(self._current_params, self.parameter_specs)
+            audio = self._render_current_audio()
         self._current_embedding = self._embed_audio(audio)
         self._current_distance = self.distance_model.distance(self._current_embedding, target_embedding)
-        if self._current_distance <= 1e-8 and self.parameter_specs:
+        min_reset_distance = max(1e-8, float(self.config.success_threshold))
+        if self._current_distance <= min_reset_distance and self.parameter_specs:
             for index, spec in enumerate(self.parameter_specs[: min(8, len(self.parameter_specs))]):
                 self._current_params[spec.stable_id] = float(
                     np.clip(self._current_params[spec.stable_id] + (index + 1) * self.config.action_step, 0.0, 1.0)

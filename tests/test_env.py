@@ -20,6 +20,10 @@ class FakeHost:
     def __init__(self):
         self.config = SynthHostConfig(plugin_path=Path("dummy.vst3"))
         self.params = {"cutoff": 0.5, "resonance": 0.25}
+        self._preset_states = {
+            b"preset-a": {"cutoff": 1.0, "resonance": 0.0},
+            b"preset-b": {"cutoff": 0.0, "resonance": 1.0},
+        }
 
     def filter_parameters(self, allowlist=None, denylist=None):
         _ = allowlist, denylist
@@ -35,6 +39,12 @@ class FakeHost:
         _ = parameter_specs
         self.params.update(normalized_values)
 
+    def capture_preset_state(self):
+        return b"preset-a"
+
+    def restore_preset_state(self, state):
+        self.params = dict(self._preset_states[state])
+
     def render_note(self, parameter_values=None, note=None, duration=None, velocity=None):
         _ = note, duration, velocity
         if parameter_values:
@@ -49,6 +59,49 @@ class FakeEmbedder:
 
 
 class EnvTests(unittest.TestCase):
+    def test_manifest_reset_prefers_other_preset_start(self):
+        config = SynthEnvConfig(
+            host=SynthHostConfig(plugin_path=Path("dummy.vst3")),
+            reward=RewardConfig(mode="clap"),
+            action_step=0.1,
+            max_episode_steps=2,
+        )
+        manifest_path = Path("/tmp/test_manifest_reset_prefers_other_preset_start.json")
+        manifest_path.write_text(
+            """
+{
+  "targets": [
+    {
+      "target_id": "train-a",
+      "split": "train",
+      "label": "A",
+      "parameter_snapshot": {"cutoff": 1.0, "resonance": 0.0},
+      "preset_state_path": "/tmp/test-preset-a.bin"
+    },
+    {
+      "target_id": "train-b",
+      "split": "train",
+      "label": "B",
+      "parameter_snapshot": {"cutoff": 0.0, "resonance": 1.0},
+      "preset_state_path": "/tmp/test-preset-b.bin"
+    }
+  ]
+}
+            """.strip()
+        )
+        Path("/tmp/test-preset-a.bin").write_bytes(b"preset-a")
+        Path("/tmp/test-preset-b.bin").write_bytes(b"preset-b")
+        env = SynthProgrammingEnv(
+            config,
+            CurriculumConfig(pool_size=2, train_size=2, val_size=0, test_size=0, manifest_path=manifest_path),
+            FakeHost(),
+            FakeEmbedder(),
+        )
+        _, info = env.reset(seed=0)
+        snapshot = info["parameter_snapshot"]
+        self.assertEqual(snapshot, {"cutoff": 0.0, "resonance": 1.0})
+        self.assertEqual(info["target_id"], "train-a")
+
     def test_env_step_changes_one_parameter(self):
         config = SynthEnvConfig(
             host=SynthHostConfig(plugin_path=Path("dummy.vst3")),

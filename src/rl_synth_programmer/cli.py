@@ -13,7 +13,7 @@ from .config import CurriculumConfig, ExperimentConfig, RewardConfig, SynthEnvCo
 from .env import make_env
 from .host import SynthHost
 from .smoke import full_smoke_run, generate_target_set, inspect_plugin, smoke_evaluate, smoke_random_env, smoke_train_clap
-from .training import evaluate_dqn, run_random_policy, train_dqn
+from .training import evaluate_dqn, run_random_policy, train_dqn, train_dqn_batched
 
 ARTIFACTS_ROOT = Path("artifacts")
 TARGETS_DIR_NAME = "targets"
@@ -142,6 +142,24 @@ def _base_parser() -> argparse.ArgumentParser:
         "--tensorboard-dir",
         default=None,
         help="Optional TensorBoard subdirectory under artifacts/. If omitted, defaults to <run-folder>/train_dqn/tensorboard.",
+    )
+    train_parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=1,
+        help="Parallel rollout width. This sets both the number of synth-render worker processes and the number of active episode slots. Expected range: integer >= 1. Default: 1.",
+    )
+    train_parser.add_argument(
+        "--updates-per-tick",
+        type=int,
+        default=1,
+        help="Optimizer updates run after each batched rollout tick. Expected range: integer >= 1. Default: 1.",
+    )
+    train_parser.add_argument(
+        "--clap-batch-size",
+        type=int,
+        default=None,
+        help="Maximum number of audio buffers embedded together in one CLAP batch. If omitted, it defaults to --num-workers. Expected range: integer >= 1.",
     )
 
     eval_parser = subparsers.add_parser("evaluate", help="Evaluate the latest DQN checkpoint from a run folder.")
@@ -469,6 +487,10 @@ def _experiment_config(
     manifest_path: Path | None = None,
     artifacts_dir: Path | None = None,
     run_name: str = "default",
+    num_workers: int = 1,
+    updates_per_tick: int = 1,
+    clap_batch_size: int | None = None,
+    clap_batch_timeout_ms: int = 10,
 ) -> ExperimentConfig:
     artifact_root = artifacts_dir or ARTIFACTS_ROOT / "default"
     host = SynthHostConfig(plugin_path=Path(plugin_path))
@@ -480,7 +502,18 @@ def _experiment_config(
         artifacts_dir=artifact_root,
     )
     curriculum = CurriculumConfig(manifest_path=manifest_path)
-    return ExperimentConfig(env=env, curriculum=curriculum, output_dir=artifact_root, run_name=run_name)
+    resolved_clap_batch_size = num_workers if clap_batch_size is None else clap_batch_size
+    return ExperimentConfig(
+        env=env,
+        curriculum=curriculum,
+        output_dir=artifact_root,
+        run_name=run_name,
+        num_render_workers=num_workers,
+        num_parallel_envs=num_workers,
+        updates_per_tick=updates_per_tick,
+        clap_batch_size=resolved_clap_batch_size,
+        clap_batch_timeout_ms=clap_batch_timeout_ms,
+    )
 
 
 def _cmd_inspect(plugin_path: str, run_folder: str) -> None:
@@ -522,6 +555,9 @@ def _cmd_train_dqn(
     episode_log_interval: int,
     tensorboard: bool,
     tensorboard_dir: str | None,
+    num_workers: int,
+    updates_per_tick: int,
+    clap_batch_size: int | None,
 ) -> None:
     run_root = _resolve_run_folder(run_folder, create=True)
     manifest_path = _find_manifest(run_root)
@@ -533,10 +569,15 @@ def _cmd_train_dqn(
         manifest_path=manifest_path,
         artifacts_dir=train_dir,
         run_name=train_dir.name,
+        num_workers=num_workers,
+        updates_per_tick=updates_per_tick,
+        clap_batch_size=clap_batch_size,
     )
     resolved_tensorboard_dir = _resolve_tensorboard_dir(run_root, "train-dqn", tensorboard_dir)
     checkpoint_path = train_dir / "dqn_latest.pt"
-    agent, logs = train_dqn(
+    batched = num_workers > 1
+    train_fn = train_dqn_batched if batched else train_dqn
+    agent, logs = train_fn(
         config,
         total_steps=steps,
         progress=progress,
@@ -553,6 +594,7 @@ def _cmd_train_dqn(
                 "train_dir": str(train_dir),
                 "checkpoint": str(checkpoint_path),
                 "tensorboard_dir": str(resolved_tensorboard_dir),
+                "mode": "batched" if batched else "single_env",
                 "last_log": logs[-1] if logs else None,
             },
             indent=2,
@@ -605,6 +647,9 @@ def main() -> None:
             args.episode_log_interval,
             args.tensorboard,
             args.tensorboard_dir,
+            args.num_workers,
+            args.updates_per_tick,
+            args.clap_batch_size,
         )
     elif args.command == "evaluate":
         _cmd_evaluate(

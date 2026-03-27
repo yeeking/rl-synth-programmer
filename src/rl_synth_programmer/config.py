@@ -61,8 +61,8 @@ class DQNConfig:
     warmup_steps: int = 512
     target_sync_interval: int = 250
     epsilon_start: float = 1.0
-    epsilon_end: float = 0.05
-    epsilon_decay_steps: int = 5_000
+    epsilon_end: float = 0.3
+    epsilon_decay_steps: int = 20_000
     hidden_sizes: tuple[int, ...] = (512, 256)
 
 
@@ -73,3 +73,10 @@ class ExperimentConfig:
     dqn: DQNConfig = field(default_factory=DQNConfig)
     output_dir: Path = Path("artifacts")
     run_name: str = "default"
+    num_render_workers: int = 1
+    num_parallel_envs: int = 1
+    updates_per_tick: int = 1
+    clap_batch_size: int = 8
+    clap_batch_timeout_ms: int = 10
+    render_queue_size: int = 0
+    embed_queue_size: int = 0

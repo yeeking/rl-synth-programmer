@@ -79,6 +79,9 @@ class TargetPool:
     def targets_for_split(self, split: str) -> list[TargetSpec]:
         return [target for target in self._targets if target.split == split]
 
+    def all_targets(self) -> list[TargetSpec]:
+        return list(self._targets)
+
     def _next_train_index(self) -> int:
         train_targets = self.targets_for_split("train")
         assert train_targets, "Target pool contains no training targets."

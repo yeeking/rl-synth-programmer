@@ -15,6 +15,9 @@ class AudioEmbedder(Protocol):
     def embed_audio(self, audio: np.ndarray, sample_rate: int) -> np.ndarray:
         ...
 
+    def embed_audio_batch(self, audios: list[np.ndarray], sample_rates: list[int]) -> np.ndarray:
+        ...
+
 
 @dataclass(slots=True)
 class RandomRewardModel:
@@ -73,20 +76,33 @@ class CLAPEmbedder:
 
     def embed_audio(self, audio: np.ndarray, sample_rate: int) -> np.ndarray:
         assert audio.ndim == 1, f"Expected mono audio, got shape {audio.shape}."
+        return self.embed_audio_batch([audio], [sample_rate])[0]
+
+    def embed_audio_batch(self, audios: list[np.ndarray], sample_rates: list[int]) -> np.ndarray:
+        assert len(audios) == len(sample_rates), "audios and sample_rates must have the same length."
+        assert audios, "embed_audio_batch requires at least one audio buffer."
         torch = require_dependency("torch", "ml")
         target_rate = int(self._model.args.sampling_rate)
         target_duration = int(self._model.args.duration)
-        processed = self._resample_audio(audio, sample_rate, target_rate)
         target_length = target_rate * target_duration
+        processed_batch = [
+            self._prepare_audio(audio, sample_rate, target_rate, target_length)
+            for audio, sample_rate in zip(audios, sample_rates)
+        ]
+        tensor = torch.tensor(np.stack(processed_batch), dtype=torch.float32).reshape(len(processed_batch), 1, -1)
+        with torch.no_grad():
+            embedding = self._model._get_audio_embeddings(tensor)
+        return np.asarray(embedding.detach().cpu().numpy(), dtype=np.float32)
+
+    def _prepare_audio(self, audio: np.ndarray, sample_rate: int, target_rate: int, target_length: int) -> np.ndarray:
+        assert audio.ndim == 1, f"Expected mono audio, got shape {audio.shape}."
+        processed = self._resample_audio(audio, sample_rate, target_rate)
         if processed.shape[0] < target_length:
             repeats = int(np.ceil(target_length / max(processed.shape[0], 1)))
             processed = np.tile(processed, repeats)[:target_length]
         else:
             processed = processed[:target_length]
-        tensor = torch.tensor(processed, dtype=torch.float32).reshape(1, 1, -1)
-        with torch.no_grad():
-            embedding = self._model._get_audio_embeddings(tensor)
-        return np.asarray(embedding[0].detach().cpu().numpy(), dtype=np.float32)
+        return processed
 
     @staticmethod
     def _resample_audio(audio: np.ndarray, sample_rate: int, target_rate: int) -> np.ndarray:

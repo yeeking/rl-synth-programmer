@@ -32,6 +32,9 @@ class CliLoggingOptionsTest(unittest.TestCase):
         self.assertTrue(args.tensorboard)
         self.assertIsNone(args.tensorboard_dir)
         self.assertEqual(args.run_folder, "artifacts/test_run")
+        self.assertEqual(args.num_workers, 1)
+        self.assertEqual(args.updates_per_tick, 1)
+        self.assertIsNone(args.clap_batch_size)
 
     def test_smoke_train_parser_accepts_disable_flags(self) -> None:
         parser = _base_parser()
@@ -61,6 +64,21 @@ class CliLoggingOptionsTest(unittest.TestCase):
                     "artifacts/test_run",
                     "--manifest",
                     "/tmp/manifest.json",
+                ]
+            )
+
+    def test_removed_parallel_flags_are_rejected(self) -> None:
+        parser = _base_parser()
+        with self.assertRaises(SystemExit):
+            parser.parse_args(
+                [
+                    "train-dqn",
+                    "--plugin",
+                    "/tmp/test.vst3",
+                    "--run-folder",
+                    "artifacts/test_run",
+                    "--num-render-workers",
+                    "4",
                 ]
             )
 

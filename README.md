@@ -44,6 +44,18 @@ rl-synth evaluate \
   --episodes 16
 ```
 
+Verified 4-worker batched smoke:
+
+```bash
+rl-synth train-dqn \
+  --plugin "/home/matthew/.vst3/Ultramaster KR-106.vst3" \
+  --run-folder "artifacts/runfolder_smoke" \
+  --reward-mode clap \
+  --steps 8 \
+  --num-workers 4 \
+  --clap-batch-size 4
+```
+
 ## Main Commands
 
 ```bash
@@ -67,6 +79,31 @@ Internal layout under a run folder is:
 - `smoke_*` folders for smoke-run outputs
 
 Console progress bars and stage logs are enabled by default for target generation, training, and evaluation. Use `--no-progress` to reduce live terminal output.
+
+## Parallel Batched Training
+
+`train-dqn` can run multiple synth-render workers in parallel while batching CLAP embeddings through one shared model instance. The classic single-env path remains the default.
+
+Example:
+
+```bash
+rl-synth train-dqn \
+  --plugin "/home/matthew/.vst3/Ultramaster KR-106.vst3" \
+  --run-folder "artifacts/kr106_parallel" \
+  --reward-mode clap \
+  --steps 2000 \
+  --num-workers 4 \
+  --updates-per-tick 1 \
+  --clap-batch-size 8
+```
+
+The batched path activates automatically when `--num-workers > 1`.
+
+Useful parallel options:
+
+- `--num-workers`: number of synth-render worker processes and active episode slots
+- `--updates-per-tick`: learner updates after each rollout batch
+- `--clap-batch-size`: number of audio buffers embedded together by CLAP; if omitted it defaults to `--num-workers`
 
 ## TensorBoard
 
