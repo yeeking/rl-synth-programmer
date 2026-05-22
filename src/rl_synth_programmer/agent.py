@@ -3,11 +3,12 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Deque, Iterable
+from typing import Deque
 
 import numpy as np
 
 from .config import DQNConfig
+from .networks import build_mlp
 from .optional_deps import require_dependency
 
 
@@ -55,24 +56,13 @@ class DQNAgent:
         self.config = config
         self.action_size = action_size
         self.observation_size = observation_size
-        self.online_network = self._build_network(observation_size, action_size, config.hidden_sizes)
-        self.target_network = self._build_network(observation_size, action_size, config.hidden_sizes)
+        self.online_network = build_mlp(observation_size, action_size, config.hidden_sizes)
+        self.target_network = build_mlp(observation_size, action_size, config.hidden_sizes)
         self.target_network.load_state_dict(self.online_network.state_dict())
         self.optimizer = torch.optim.Adam(self.online_network.parameters(), lr=config.learning_rate)
         self.loss_fn = torch.nn.MSELoss()
         self.replay = ReplayBuffer(config.replay_capacity)
         self.total_steps = 0
-
-    def _build_network(self, observation_size: int, action_size: int, hidden_sizes: Iterable[int]):
-        torch = self._torch
-        layers = []
-        current_size = observation_size
-        for hidden_size in hidden_sizes:
-            layers.append(torch.nn.Linear(current_size, hidden_size))
-            layers.append(torch.nn.ReLU())
-            current_size = hidden_size
-        layers.append(torch.nn.Linear(current_size, action_size))
-        return torch.nn.Sequential(*layers)
 
     def epsilon(self) -> float:
         progress = min(1.0, self.total_steps / max(1, self.config.epsilon_decay_steps))

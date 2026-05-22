@@ -32,6 +32,11 @@ rl-synth generate-target-set \
   --run-folder "artifacts/kr106_real" \
   --subset-limit 12
 
+rl-synth generate-target-set \
+  --plugin "/Users/matthewyk/Library/Audio/Plug-Ins/VST3/Dexed.vst3" \
+  --run-folder "artifacts/Dexed_real" \
+  --subset-limit 12
+
 rl-synth train-dqn \
   --plugin "/home/matthew/.vst3/Ultramaster KR-106.vst3" \
   --run-folder "artifacts/kr106_real" \
@@ -87,6 +92,98 @@ Internal layout under a run folder is:
 - `smoke_*` folders for smoke-run outputs
 
 Console progress bars and stage logs are enabled by default for target generation, training, and evaluation. Use `--no-progress` to reduce live terminal output.
+
+## Offline Action Dataset and Architecture Sweep
+
+Generate a reusable supervised dataset where each row stores the current observation and the immediate reward for every available action:
+
+```bash
+rl-synth generate-action-dataset \
+  --plugin "/home/matthew/.vst3/Ultramaster KR-106.vst3" \
+  --run-folder "artifacts/kr106_real" \
+  --max-states 256 \
+  --moves-per-start 4 \
+  --num-workers 4 \
+  --clap-batch-size 8 \
+  --render-timeout-seconds 300 \
+  --max-state-seconds 90 \
+  --shard-size 16 \
+  --yes
+
+rl-synth generate-action-dataset \
+  --plugin "/Users/matthewyk/Library/Audio/Plug-Ins/VST3/Dexed.vst3" \
+  --run-folder "artifacts/Dexed_real" \
+  --max-states 256 \
+  --moves-per-start 4 \
+  --num-workers 12 \
+  --clap-batch-size 8 \
+  --render-timeout-seconds 300 \
+  --max-state-seconds 90 \
+  --shard-size 16 \
+  --yes
+```
+
+Long dataset runs write recoverable shards under `<run-folder>/action_dataset/shards/` before the final merged `dataset.npz`.
+If a render chunk times out, `--skip-failed-actions` is enabled by default and assigns those actions a large negative reward so the run can continue.
+Use `--no-skip-failed-actions` to abort instead.
+Use `--max-state-seconds` to skip pathological slow start presets and continue with the next target/start pair.
+
+Preview estimated renders, runtime, and dataset size without writing `dataset.npz`:
+
+```bash
+rl-synth generate-action-dataset \
+  --plugin "/home/matthew/.vst3/Ultramaster KR-106.vst3" \
+  --run-folder "artifacts/kr106_real" \
+  --estimate-only
+```
+
+```bash
+rl-synth generate-action-dataset \
+  --plugin "/Users/matthewyk/Library/Audio/Plug-Ins/VST3/Dexed.vst3" \
+  --run-folder "artifacts/Dexed_real" \
+  --estimate-only
+```
+
+Compare network architectures against the generated dataset:
+
+```bash
+rl-synth compare-architectures \
+  --dataset "artifacts/kr106_real/action_dataset/dataset.npz" \
+  --config "artifacts/kr106_real/sweep.json" \
+  --out-dir "artifacts/kr106_real/architecture_sweep"
+```
+
+Example sweep config:
+
+```json
+{
+  "split": {"train": 0.8, "val": 0.1, "test": 0.1},
+  "architectures": [
+    {
+      "name": "mlp-512-256",
+      "type": "mlp",
+      "hidden_sizes": [512, 256],
+      "learning_rate": 0.001,
+      "batch_size": 64,
+      "epochs": 20,
+      "seed": 7
+    },
+    {
+      "name": "cnn-small",
+      "type": "cnn1d",
+      "channels": [32, 64],
+      "kernel_sizes": [5, 3],
+      "embedding_hidden_size": 128,
+      "param_hidden_sizes": [64],
+      "head_hidden_sizes": [128],
+      "learning_rate": 0.001,
+      "batch_size": 64,
+      "epochs": 20,
+      "seed": 8
+    }
+  ]
+}
+```
 
 ## Parallel Batched Training
 

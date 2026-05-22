@@ -9,7 +9,7 @@ import numpy as np
 from .agent import DQNAgent, RandomAgent, ReplayTransition
 from .config import ExperimentConfig
 from .env import SynthProgrammingEnv, make_env
-from .host import SynthHost
+from .host import SynthHost, nudge_parameter_values
 from .logging_utils import create_summary_writer, log_run_metadata, make_progress_bar, stage_log
 from .optional_deps import require_dependency
 from .parallel_rollout import (
@@ -306,13 +306,12 @@ def _prime_target_embeddings(
 def _reset_slot_batch(
     coordinator: BatchedRolloutCoordinator,
     slot_ids: list[int],
-    default_params: dict[str, float],
     render_pool: ParallelRenderPool,
     embedder,
     *,
     batch_size: int,
 ) -> list[EpisodeSlotState]:
-    pending_states, requests = coordinator.reset_slot_requests(slot_ids, default_params)
+    pending_states, requests = coordinator.reset_slot_requests(slot_ids)
     render_results = render_pool.render_batch(requests)
     embeddings = embed_audio_batch(
         embedder,
@@ -328,10 +327,11 @@ def _reset_slot_batch(
         distance = coordinator.distance_model.distance(np.asarray(embedding, dtype=np.float32), state.target.embedding)
         min_reset_distance = max(1e-8, float(coordinator.config.success_threshold))
         if distance <= min_reset_distance and coordinator.parameter_specs:
-            for index, spec in enumerate(coordinator.parameter_specs[: min(8, len(coordinator.parameter_specs))]):
-                state.current_params[spec.stable_id] = float(
-                    np.clip(state.current_params[spec.stable_id] + (index + 1) * coordinator.config.action_step, 0.0, 1.0)
-                )
+            state.current_params = nudge_parameter_values(
+                state.current_params,
+                coordinator.parameter_specs,
+                coordinator.config.action_step,
+            )
             rerender_states.append(state)
             rerender_requests.append(
                 RenderRequest(slot_id=state.slot_id, render_mode="parameter_state", parameters=dict(state.current_params))
@@ -387,7 +387,6 @@ def train_dqn_batched(
         allowlist=config.env.parameter_allowlist,
         denylist=config.env.parameter_denylist,
     )
-    default_params = probe_host.get_normalized_defaults(parameter_specs)
     coordinator = BatchedRolloutCoordinator(config.env, config.curriculum, parameter_specs)
     embedder = build_embedder(config.env.reward)
     writer = create_summary_writer(tensorboard, tensorboard_dir or config.output_dir / "tensorboard")
@@ -407,7 +406,6 @@ def train_dqn_batched(
         slot_states = _reset_slot_batch(
             coordinator,
             list(range(config.num_parallel_envs)),
-            default_params,
             render_pool,
             embedder,
             batch_size=config.clap_batch_size,
@@ -585,7 +583,6 @@ def train_dqn_batched(
                 reset_states = _reset_slot_batch(
                     coordinator,
                     pending_resets,
-                    default_params,
                     render_pool,
                     embedder,
                     batch_size=config.clap_batch_size,

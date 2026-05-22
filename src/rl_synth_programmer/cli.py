@@ -9,9 +9,11 @@ from pathlib import Path
 
 import numpy as np
 
+from .architecture_sweep import compare_architectures
 from .config import CurriculumConfig, DQNConfig, ExperimentConfig, RewardConfig, SynthEnvConfig, SynthHostConfig
 from .env import make_env
 from .host import SynthHost
+from .offline_dataset import ActionDatasetConfig, estimate_action_dataset, generate_action_dataset
 from .smoke import full_smoke_run, generate_target_set, inspect_plugin, smoke_evaluate, smoke_random_env, smoke_train_clap
 from .training import evaluate_dqn, run_random_policy, train_dqn, train_dqn_batched
 
@@ -237,6 +239,107 @@ def _base_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Enable live progress output while rendering target presets. Use --no-progress for quieter output. Default: enabled.",
+    )
+
+    dataset_parser = subparsers.add_parser(
+        "generate-action-dataset",
+        help="Generate a reusable all-actions supervised reward dataset from a target manifest.",
+    )
+    dataset_parser.add_argument("--plugin", required=True, help="Path to the .vst3 synth plugin.")
+    dataset_parser.add_argument(
+        "--run-folder",
+        required=True,
+        help="Artifact root under artifacts/. The command reads targets/manifest.json and writes action_dataset/ beneath it.",
+    )
+    dataset_parser.add_argument(
+        "--reward-mode",
+        choices=("clap",),
+        default="clap",
+        help="Reward source for action labels. Default: clap.",
+    )
+    dataset_parser.add_argument("--max-states", type=int, default=256, help="Maximum dataset rows to generate. Default: 256.")
+    dataset_parser.add_argument(
+        "--moves-per-start",
+        type=int,
+        default=4,
+        help="Greedy best-action moves to take from each target/start pair. Default: 4.",
+    )
+    dataset_parser.add_argument("--num-workers", type=int, default=1, help="Parallel render worker count. Default: 1.")
+    dataset_parser.add_argument(
+        "--clap-batch-size",
+        type=int,
+        default=8,
+        help="Maximum audio buffers embedded in one CLAP batch. Default: 8.",
+    )
+    dataset_parser.add_argument(
+        "--estimate-only",
+        action="store_true",
+        help="Run one representative all-action evaluation and print cost estimates without writing dataset.npz.",
+    )
+    dataset_parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Confirm generation when estimated render count is large.",
+    )
+    dataset_parser.add_argument(
+        "--render-timeout-seconds",
+        type=float,
+        default=300.0,
+        help="Timeout for one render batch/chunk. Timed-out chunks are skipped by default. Default: 300.",
+    )
+    dataset_parser.add_argument(
+        "--skip-failed-actions",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Mark timed-out action chunks with a large negative reward instead of aborting. Default: enabled.",
+    )
+    dataset_parser.add_argument(
+        "--shard-size",
+        type=int,
+        default=16,
+        help="Write a recoverable shard every N generated states. Default: 16.",
+    )
+    dataset_parser.add_argument(
+        "--render-chunk-size",
+        type=int,
+        default=0,
+        help="Actions per render batch. Default 0 means --num-workers, which limits timeout blast radius.",
+    )
+    dataset_parser.add_argument(
+        "--max-state-seconds",
+        type=float,
+        default=None,
+        help="Skip a dataset state after this many seconds and move to the next target/start pair. Default: disabled.",
+    )
+    dataset_parser.add_argument(
+        "--progress",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable progress bars and stage logs. Default: enabled.",
+    )
+
+    sweep_parser = subparsers.add_parser(
+        "compare-architectures",
+        help="Train and rank supervised action-value architectures against a generated action dataset.",
+    )
+    sweep_parser.add_argument("--dataset", required=True, help="Path to action_dataset/dataset.npz.")
+    sweep_parser.add_argument("--config", required=True, help="Path to JSON architecture sweep config.")
+    sweep_parser.add_argument(
+        "--out-dir",
+        required=True,
+        help="Output directory for architecture sweep artifacts. Relative paths are resolved under artifacts/.",
+    )
+    sweep_parser.add_argument(
+        "--progress",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable progress bars and stage logs. Default: enabled.",
+    )
+    sweep_parser.add_argument(
+        "--tensorboard",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Write TensorBoard logs for supervised architecture training. Default: disabled.",
     )
 
     smoke_random_parser = subparsers.add_parser("smoke-random-env", help="Run the random-agent smoke baseline.")
@@ -651,6 +754,65 @@ def _cmd_evaluate(
     print(json.dumps([asdict(metric) for metric in metrics], indent=2))
 
 
+def _cmd_generate_action_dataset(
+    plugin_path: str,
+    run_folder: str,
+    reward_mode: str,
+    max_states: int,
+    moves_per_start: int,
+    num_workers: int,
+    clap_batch_size: int,
+    estimate_only: bool,
+    yes: bool,
+    progress: bool,
+    render_timeout_seconds: float,
+    skip_failed_actions: bool,
+    shard_size: int,
+    render_chunk_size: int,
+    max_state_seconds: float | None,
+) -> None:
+    run_root = _resolve_run_folder(run_folder, create=True)
+    manifest_path = _find_manifest(run_root)
+    config = ActionDatasetConfig(
+        plugin_path=Path(plugin_path),
+        manifest_path=manifest_path,
+        output_dir=run_root,
+        reward_mode=reward_mode,
+        max_states=max_states,
+        moves_per_start=moves_per_start,
+        num_workers=num_workers,
+        clap_batch_size=clap_batch_size,
+        render_timeout_seconds=render_timeout_seconds,
+        skip_failed_actions=skip_failed_actions,
+        shard_size=shard_size,
+        render_chunk_size=render_chunk_size,
+        max_state_seconds=max_state_seconds,
+    )
+    estimate = estimate_action_dataset(config, progress=progress)
+    if estimate_only:
+        print(json.dumps({"run_folder": str(run_root), "estimate": estimate}, indent=2))
+        return
+    result = generate_action_dataset(config, progress=progress, yes=yes, estimate=estimate)
+    print(json.dumps(result, indent=2))
+
+
+def _cmd_compare_architectures(
+    dataset_path: str,
+    config_path: str,
+    out_dir: str,
+    progress: bool,
+    tensorboard: bool,
+) -> None:
+    result = compare_architectures(
+        Path(dataset_path),
+        Path(config_path),
+        _resolve_run_folder(out_dir, create=True),
+        progress=progress,
+        tensorboard=tensorboard,
+    )
+    print(json.dumps(result, indent=2))
+
+
 def main() -> None:
     parser = _base_parser()
     args = parser.parse_args()
@@ -699,6 +861,32 @@ def main() -> None:
                 ),
                 indent=2,
             )
+        )
+    elif args.command == "generate-action-dataset":
+        _cmd_generate_action_dataset(
+            args.plugin,
+            args.run_folder,
+            args.reward_mode,
+            args.max_states,
+            args.moves_per_start,
+            args.num_workers,
+            args.clap_batch_size,
+            args.estimate_only,
+            args.yes,
+            args.progress,
+            args.render_timeout_seconds,
+            args.skip_failed_actions,
+            args.shard_size,
+            args.render_chunk_size,
+            args.max_state_seconds,
+        )
+    elif args.command == "compare-architectures":
+        _cmd_compare_architectures(
+            args.dataset,
+            args.config,
+            args.out_dir,
+            args.progress,
+            args.tensorboard,
         )
     elif args.command == "smoke-random-env":
         run_root = _resolve_run_folder(args.run_folder, create=False)

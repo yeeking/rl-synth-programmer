@@ -8,7 +8,7 @@ import numpy as np
 
 from .config import CurriculumConfig, RewardConfig, SynthEnvConfig
 from .curriculum import TargetPool, TargetSpec
-from .host import ParameterSpec, SynthHost
+from .host import ParameterSpec, SynthHost, nudge_parameter_values
 from .reward import AudioEmbedder, RandomRewardModel, SimilarityRewardModel, build_embedder
 
 try:
@@ -175,10 +175,11 @@ class SynthProgrammingEnv(gym.Env):
         self._current_distance = self.distance_model.distance(self._current_embedding, target_embedding)
         min_reset_distance = max(1e-8, float(self.config.success_threshold))
         if self._current_distance <= min_reset_distance and self.parameter_specs:
-            for index, spec in enumerate(self.parameter_specs[: min(8, len(self.parameter_specs))]):
-                self._current_params[spec.stable_id] = float(
-                    np.clip(self._current_params[spec.stable_id] + (index + 1) * self.config.action_step, 0.0, 1.0)
-                )
+            self._current_params = nudge_parameter_values(
+                self._current_params,
+                self.parameter_specs,
+                self.config.action_step,
+            )
             self.host.set_parameters(self._current_params, self.parameter_specs)
             audio = self._render_current_audio()
             self._current_embedding = self._embed_audio(audio)

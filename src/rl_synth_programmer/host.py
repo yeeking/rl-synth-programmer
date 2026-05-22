@@ -297,3 +297,17 @@ class SynthHost:
         assert path.exists(), f"Plugin path does not exist: {path}"
         assert path.suffix.lower() == ".vst3", f"Expected a .vst3 plugin path, got: {path}"
         return path
+
+
+def nudge_parameter_values(
+    parameters: dict[str, float],
+    parameter_specs: list[ParameterSpec],
+    action_step: float,
+    *,
+    limit: int = 8,
+) -> dict[str, float]:
+    """Return a small deterministic parameter perturbation used to avoid zero-distance resets."""
+    nudged = dict(parameters)
+    for index, spec in enumerate(parameter_specs[: min(limit, len(parameter_specs))]):
+        nudged[spec.stable_id] = float(np.clip(nudged[spec.stable_id] + (index + 1) * action_step, 0.0, 1.0))
+    return nudged

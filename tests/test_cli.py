@@ -68,6 +68,50 @@ class CliLoggingOptionsTest(unittest.TestCase):
         )
         self.assertEqual(args.max_episode_steps, 48)
 
+    def test_generate_action_dataset_parser_defaults(self) -> None:
+        parser = _base_parser()
+        args = parser.parse_args(
+            [
+                "generate-action-dataset",
+                "--plugin",
+                "/tmp/test.vst3",
+                "--run-folder",
+                "artifacts/test_run",
+            ]
+        )
+        self.assertEqual(args.reward_mode, "clap")
+        self.assertEqual(args.max_states, 256)
+        self.assertEqual(args.moves_per_start, 4)
+        self.assertEqual(args.num_workers, 1)
+        self.assertEqual(args.clap_batch_size, 8)
+        self.assertFalse(args.estimate_only)
+        self.assertFalse(args.yes)
+        self.assertEqual(args.render_timeout_seconds, 300.0)
+        self.assertTrue(args.skip_failed_actions)
+        self.assertEqual(args.shard_size, 16)
+        self.assertEqual(args.render_chunk_size, 0)
+        self.assertIsNone(args.max_state_seconds)
+        self.assertTrue(args.progress)
+
+    def test_compare_architectures_parser_defaults(self) -> None:
+        parser = _base_parser()
+        args = parser.parse_args(
+            [
+                "compare-architectures",
+                "--dataset",
+                "/tmp/dataset.npz",
+                "--config",
+                "/tmp/sweep.json",
+                "--out-dir",
+                "artifacts/sweep",
+            ]
+        )
+        self.assertEqual(args.dataset, "/tmp/dataset.npz")
+        self.assertEqual(args.config, "/tmp/sweep.json")
+        self.assertEqual(args.out_dir, "artifacts/sweep")
+        self.assertTrue(args.progress)
+        self.assertFalse(args.tensorboard)
+
     def test_smoke_train_parser_accepts_disable_flags(self) -> None:
         parser = _base_parser()
         args = parser.parse_args(

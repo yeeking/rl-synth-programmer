@@ -11,7 +11,7 @@ import numpy as np
 
 from .config import CurriculumConfig, RewardConfig, SynthEnvConfig, SynthHostConfig
 from .curriculum import TargetPool, TargetSpec
-from .host import ParameterSpec, SynthHost
+from .host import ParameterSpec, SynthHost, nudge_parameter_values
 from .reward import AudioEmbedder, RandomRewardModel, SimilarityRewardModel
 
 _WORKER_HOST: SynthHost | None = None
@@ -103,25 +103,42 @@ class ParallelRenderPool:
         self.host_config = host_config
         self.num_workers = int(num_workers)
         self._ctx = mp.get_context("spawn")
+        self._pool = None
+        self._open_pool()
+
+    def _open_pool(self) -> None:
         self._pool = self._ctx.Pool(
             processes=self.num_workers,
             initializer=_render_worker_init,
             initargs=(self.host_config,),
         )
 
-    def render_batch(self, requests: Iterable[RenderRequest]) -> list[RenderResult]:
+    def render_batch(self, requests: Iterable[RenderRequest], timeout_seconds: float | None = None) -> list[RenderResult]:
         request_list = list(requests)
         if not request_list:
             return []
-        return list(self._pool.map(_render_worker, request_list, chunksize=1))
+        assert self._pool is not None, "Render pool is not open."
+        if timeout_seconds is None:
+            return list(self._pool.map(_render_worker, request_list, chunksize=1))
+        async_result = self._pool.map_async(_render_worker, request_list, chunksize=1)
+        try:
+            return list(async_result.get(timeout=float(timeout_seconds)))
+        except mp.TimeoutError as exc:
+            self.terminate()
+            self._open_pool()
+            raise TimeoutError(f"Render batch timed out after {timeout_seconds} seconds.") from exc
 
     def close(self) -> None:
-        self._pool.close()
-        self._pool.join()
+        if self._pool is not None:
+            self._pool.close()
+            self._pool.join()
+            self._pool = None
 
     def terminate(self) -> None:
-        self._pool.terminate()
-        self._pool.join()
+        if self._pool is not None:
+            self._pool.terminate()
+            self._pool.join()
+            self._pool = None
 
     def __enter__(self) -> ParallelRenderPool:
         return self
@@ -196,16 +213,14 @@ class BatchedRolloutCoordinator:
             if candidate.target_id != target.target_id and candidate.preset_state_path
         ]
 
-    def sample_initial_state(self, target: TargetSpec, default_params: dict[str, float]) -> tuple[dict[str, float], bytes | None]:
-        _ = default_params
+    def sample_initial_state(self, target: TargetSpec) -> tuple[dict[str, float], bytes | None]:
         preset_candidates = self.preset_start_candidates(target)
         if preset_candidates:
             start_target = preset_candidates[int(self._rng.integers(0, len(preset_candidates)))]
             return dict(start_target.parameters), Path(start_target.preset_state_path).read_bytes()
-        return self.sample_initial_params(default_params), None
+        return self.sample_initial_params(), None
 
-    def sample_initial_params(self, default_params: dict[str, float]) -> dict[str, float]:
-        _ = default_params
+    def sample_initial_params(self) -> dict[str, float]:
         return {
             spec.stable_id: float(self._rng.uniform(0.0, 1.0))
             for spec in self.parameter_specs
@@ -255,13 +270,13 @@ class BatchedRolloutCoordinator:
         self._next_episode_id += 1
         return episode_id
 
-    def reset_slot_requests(self, slot_ids: list[int], default_params: dict[str, float]) -> tuple[list[EpisodeSlotState], list[RenderRequest]]:
+    def reset_slot_requests(self, slot_ids: list[int]) -> tuple[list[EpisodeSlotState], list[RenderRequest]]:
         states: list[EpisodeSlotState] = []
         requests: list[RenderRequest] = []
         for slot_id in slot_ids:
             target = self.curriculum.maybe_advance()
             assert target.embedding is not None, f"Target {target.target_id} has no cached embedding."
-            params, initial_preset_state = self.sample_initial_state(target, default_params)
+            params, initial_preset_state = self.sample_initial_state(target)
             states.append(
                 EpisodeSlotState(
                     slot_id=slot_id,
@@ -300,10 +315,11 @@ class BatchedRolloutCoordinator:
             embedding = embedding_by_slot[state.slot_id]
             distance = self.distance_model.distance(embedding, state.target.embedding)
             if distance <= 1e-8 and self.parameter_specs:
-                for index, spec in enumerate(self.parameter_specs[: min(8, len(self.parameter_specs))]):
-                    state.current_params[spec.stable_id] = float(
-                        np.clip(state.current_params[spec.stable_id] + (index + 1) * self.config.action_step, 0.0, 1.0)
-                    )
+                state.current_params = nudge_parameter_values(
+                    state.current_params,
+                    self.parameter_specs,
+                    self.config.action_step,
+                )
                 raise RuntimeError("Zero-distance reset requires rerender and should be handled upstream.")
             state.current_embedding = embedding
             state.current_distance = float(distance)

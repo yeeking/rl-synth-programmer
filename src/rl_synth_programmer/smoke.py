@@ -335,9 +335,9 @@ def smoke_train_clap(
     out_dir = _artifact_dir(artifacts_dir, "smoke_train_clap")
     checkpoint_path = out_dir / "dqn_smoke.pt"
     agent.save(checkpoint_path)
+    assert checkpoint_path.exists(), f"Expected checkpoint to be written: {checkpoint_path}"
     finite_losses = [float(item["loss"]) for item in logs if np.isfinite(float(item["loss"]))]
     assert finite_losses, "Training never produced a finite loss."
-    assert checkpoint_path.exists() is False or True
     summary = {
         "steps": steps,
         "first_finite_loss_step": float(next(item["step"] for item in logs if np.isfinite(float(item["loss"])))),
