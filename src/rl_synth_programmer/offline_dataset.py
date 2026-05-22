@@ -21,6 +21,27 @@ LARGE_RENDER_WARNING_THRESHOLD = 10_000
 
 @dataclass(slots=True)
 class ActionDatasetConfig:
+    """Configuration for offline all-actions dataset generation.
+
+    plugin_path: VST3 instrument plugin used for rendering candidate synth states.
+    manifest_path: target manifest produced by generate-target-set.
+    output_dir: run folder where action_dataset/ artifacts are written.
+    reward_mode: reward backend; v1 supports CLAP-backed distance rewards.
+    max_states: maximum dataset rows to generate. one row is values for all parameter tweaks from a given position in terms of how much closer you get from that position to a target position when you make a given parameter tweak
+    moves_per_start: greedy best-action steps to collect from each target/start preset pair.
+    num_workers: number of parallel render worker processes.
+    clap_batch_size: number of rendered audio buffers embedded per CLAP batch.
+    action_step: normalized parameter delta used by each +/- action.
+    seed: deterministic seed for curriculum/coordinator setup.
+    render_timeout_seconds: timeout for one render batch/chunk; None disables it.
+    skip_failed_actions: if true, timed-out chunks receive failed_action_reward and generation continues.
+    failed_action_reward: label value assigned to actions skipped after timeout/slow-state limits.
+    shard_size: write a recoverable shard after this many generated rows.
+    render_chunk_size: actions per render batch; 0 means use num_workers.
+    max_state_seconds: skip the rest of a state after this many seconds; None disables it.
+    reload_workers_every_pair: reload plugin worker processes after each target/start pair.
+    """
+
     plugin_path: Path
     manifest_path: Path
     output_dir: Path
@@ -37,6 +58,7 @@ class ActionDatasetConfig:
     shard_size: int = 16
     render_chunk_size: int = 0
     max_state_seconds: float | None = None
+    reload_workers_every_pair: bool = True
 
 
 def _memory_snapshot() -> dict[str, float | str]:
@@ -170,6 +192,7 @@ def _evaluate_all_actions(
     render_chunk_size: int,
     state_number: int | None = None,
     deadline: float | None = None,
+    render_progress=None,
 ) -> tuple[np.ndarray, list[dict[str, float]], list[np.ndarray], list[float], list[int]]:
     assert target.embedding is not None, f"Target {target.target_id} has no embedding."
     requests: list[RenderRequest] = []
@@ -195,6 +218,8 @@ def _evaluate_all_actions(
                 f"marking remaining actions {action_ids[0]}-{action_ids[-1]} as failed."
             )
             failed_actions.extend(action_ids)
+            if render_progress is not None:
+                render_progress.update(len(action_ids))
             break
         request_chunk = requests[start : start + max(1, chunk_size)]
         render_started = perf_counter()
@@ -211,6 +236,8 @@ def _evaluate_all_actions(
                 raise TimeoutError(message)
             stage_log(message + f" Marking {len(action_ids)} action(s) as failed.")
             failed_actions.extend(action_ids)
+            if render_progress is not None:
+                render_progress.update(len(action_ids))
             continue
         embeddings = embed_audio_batch(
             embedder,
@@ -226,6 +253,8 @@ def _evaluate_all_actions(
             rewards[action_id] = float(current_distance - next_distance)
             distances[action_id] = float(next_distance)
             next_embeddings[action_id] = next_embedding
+        if render_progress is not None:
+            render_progress.update(len(results))
     if not np.any(rewards > float(failed_action_reward)):
         raise RuntimeError(f"All action renders failed for target={target.target_id} state={state_number}.")
     return rewards, next_params_list, next_embeddings, distances, failed_actions
@@ -243,7 +272,7 @@ def estimate_action_dataset(config: ActionDatasetConfig, *, progress: bool = Tru
     pairs = _target_start_pairs(targets)
     assert pairs, "Manifest must contain at least two preset-state targets for preset-pair dataset generation."
     embedder = build_embedder(env_config.reward)
-    with ParallelRenderPool(env_config.host, config.num_workers) as render_pool:
+    with _open_render_pool(env_config.host, config.num_workers) as render_pool:
         _prime_target_embeddings(
             coordinator,
             render_pool,
@@ -408,6 +437,17 @@ def _merge_shards(shard_paths: list[Path]) -> dict[str, np.ndarray]:
     return arrays
 
 
+def _open_render_pool(host_config: SynthHostConfig, num_workers: int):
+    return ParallelRenderPool(host_config, num_workers)
+
+
+def _close_render_pool(render_pool) -> None:
+    if hasattr(render_pool, "close"):
+        render_pool.close()
+    elif hasattr(render_pool, "__exit__"):
+        render_pool.__exit__(None, None, None)
+
+
 def generate_action_dataset(
     config: ActionDatasetConfig,
     *,
@@ -439,7 +479,8 @@ def generate_action_dataset(
     shard_index = 0
     total_written_rows = 0
     started = perf_counter()
-    with ParallelRenderPool(env_config.host, config.num_workers) as render_pool:
+    render_pool = _open_render_pool(env_config.host, config.num_workers)
+    try:
         _prime_target_embeddings(
             coordinator,
             render_pool,
@@ -448,12 +489,16 @@ def generate_action_dataset(
             progress=progress,
             timeout_seconds=config.render_timeout_seconds,
         )
+        if config.reload_workers_every_pair:
+            _close_render_pool(render_pool)
+            render_pool = _open_render_pool(env_config.host, config.num_workers)
         targets = coordinator.curriculum.all_targets()
         pairs = _target_start_pairs(targets)
         assert pairs, "Manifest must contain at least two preset-state targets for preset-pair dataset generation."
         target_ids = [target.target_id for target in targets]
         total_states = _sample_state_count(config, pairs)
-        progress_bar = make_progress_bar(total=total_states, desc="action dataset states", enabled=progress)
+        total_action_renders = total_states * int(coordinator.action_size)
+        progress_bar = make_progress_bar(total=total_action_renders, desc="action renders", enabled=progress)
         for target_index, start_index in pairs:
             if total_written_rows + len(rows["observations"]) >= total_states:
                 break
@@ -490,6 +535,7 @@ def generate_action_dataset(
                     render_chunk_size=config.render_chunk_size or config.num_workers,
                     state_number=current_row_number,
                     deadline=deadline,
+                    render_progress=progress_bar,
                 )
                 best_action = int(np.argmax(rewards))
                 state_skipped = int(
@@ -524,8 +570,13 @@ def generate_action_dataset(
                         f"State {current_row_number}/{total_states} completed with "
                         f"{len(failed_actions)} failed action(s); best_action={best_action}."
                     )
-                progress_bar.set_postfix({"target": target.target_id, "best": f"{float(rewards[best_action]):.4f}"})
-                progress_bar.update(1)
+                progress_bar.set_postfix(
+                    {
+                        "state": f"{current_row_number}/{total_states}",
+                        "target": target.target_id,
+                        "best": f"{float(rewards[best_action]):.4f}",
+                    }
+                )
                 if len(rows["observations"]) >= max(1, config.shard_size):
                     path = _write_shard(shards_dir, rows, shard_index)
                     if path is not None:
@@ -535,7 +586,12 @@ def generate_action_dataset(
                         rows = _empty_rows()
                 if state_skipped:
                     break
+            if config.reload_workers_every_pair and total_written_rows + len(rows["observations"]) < total_states:
+                _close_render_pool(render_pool)
+                render_pool = _open_render_pool(env_config.host, config.num_workers)
         progress_bar.close()
+    finally:
+        _close_render_pool(render_pool)
 
     if rows["observations"]:
         path = _write_shard(shards_dir, rows, shard_index)
@@ -582,6 +638,7 @@ def generate_action_dataset(
             "shard_size": int(config.shard_size),
             "render_chunk_size": int(config.render_chunk_size or config.num_workers),
             "max_state_seconds": config.max_state_seconds,
+            "reload_workers_every_pair": bool(config.reload_workers_every_pair),
         },
         "shards": [str(path) for path in shard_paths],
     }

@@ -312,6 +312,12 @@ def _base_parser() -> argparse.ArgumentParser:
         help="Skip a dataset state after this many seconds and move to the next target/start pair. Default: disabled.",
     )
     dataset_parser.add_argument(
+        "--reload-workers-every-pair",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Reload render-worker plugin instances after each target/start preset pair. Default: enabled.",
+    )
+    dataset_parser.add_argument(
         "--progress",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -770,6 +776,7 @@ def _cmd_generate_action_dataset(
     shard_size: int,
     render_chunk_size: int,
     max_state_seconds: float | None,
+    reload_workers_every_pair: bool,
 ) -> None:
     run_root = _resolve_run_folder(run_folder, create=True)
     manifest_path = _find_manifest(run_root)
@@ -787,6 +794,7 @@ def _cmd_generate_action_dataset(
         shard_size=shard_size,
         render_chunk_size=render_chunk_size,
         max_state_seconds=max_state_seconds,
+        reload_workers_every_pair=reload_workers_every_pair,
     )
     estimate = estimate_action_dataset(config, progress=progress)
     if estimate_only:
@@ -879,6 +887,7 @@ def main() -> None:
             args.shard_size,
             args.render_chunk_size,
             args.max_state_seconds,
+            args.reload_workers_every_pair,
         )
     elif args.command == "compare-architectures":
         _cmd_compare_architectures(

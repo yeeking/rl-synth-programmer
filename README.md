@@ -108,6 +108,7 @@ rl-synth generate-action-dataset \
   --render-timeout-seconds 300 \
   --max-state-seconds 90 \
   --shard-size 16 \
+  --reload-workers-every-pair \
   --yes
 
 rl-synth generate-action-dataset \
@@ -120,6 +121,7 @@ rl-synth generate-action-dataset \
   --render-timeout-seconds 300 \
   --max-state-seconds 90 \
   --shard-size 16 \
+  --reload-workers-every-pair \
   --yes
 ```
 
@@ -127,6 +129,7 @@ Long dataset runs write recoverable shards under `<run-folder>/action_dataset/sh
 If a render chunk times out, `--skip-failed-actions` is enabled by default and assigns those actions a large negative reward so the run can continue.
 Use `--no-skip-failed-actions` to abort instead.
 Use `--max-state-seconds` to skip pathological slow start presets and continue with the next target/start pair.
+Render workers are reloaded after each target/start pair by default; use `--no-reload-workers-every-pair` to keep plugin instances alive for speed.
 
 Preview estimated renders, runtime, and dataset size without writing `dataset.npz`:
 
@@ -233,4 +236,35 @@ Example:
 
 ```bash
 tensorboard --logdir artifacts/kr106_real/train_dqn/tensorboard
+```
+
+## Example commands from myk
+
+Generate a large dataset on Dexed
+
+```
+## this generates the target sounds from presets which are used as 'from->to'
+## positions in training
+## subset-limit dictates how many presets we render, which for Dexed
+## is the 32 that are in the bank 
+rl-synth generate-target-set \
+  --plugin "/Users/matthewyk/Library/Audio/Plug-Ins/VST3/Dexed.vst3" \
+  --run-folder "artifacts/Dexed_large" \
+  --subset-limit 32 
+
+## now we have our target dataset, we render out 
+## a pre-training dataset which contains 
+## pre-computed rewards for parameter tweaks (actions) made
+## as we move around in the latent space 
+rl-synth generate-action-dataset \
+  --plugin "/Users/matthewyk/Library/Audio/Plug-Ins/VST3/Dexed.vst3" \
+  --run-folder "artifacts/Dexed_large" \
+  --max-states 1024 \
+  --moves-per-start 128 \
+  --num-workers 12 \
+  --clap-batch-size 8 \
+  --render-timeout-seconds 120 \
+  --shard-size 8 \
+  --yes
+
 ```

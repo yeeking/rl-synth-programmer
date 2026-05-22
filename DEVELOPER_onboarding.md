@@ -1,0 +1,232 @@
+# Developer Onboarding: RL Synth Programmer
+
+This project trains a reinforcement-learning agent to program VST3 instrument presets. The agent edits normalized synth parameters, renders the plugin audio, embeds that audio, and receives reward when the rendered sound moves closer to a target preset sound.
+
+## Repository Shape
+
+- `src/rl_synth_programmer/config.py` contains dataclass configuration for the host, environment, reward, curriculum, DQN, and full experiment.
+- `src/rl_synth_programmer/host.py` wraps `pedalboard` VST3 loading, parameter discovery, preset state capture/restore, parameter setting, and MIDI note rendering.
+- `src/rl_synth_programmer/curriculum.py` defines `TargetSpec` and `TargetPool`, which provide target presets to training episodes.
+- `src/rl_synth_programmer/env.py` implements the Gym-style single-environment rollout.
+- `src/rl_synth_programmer/reward.py` wraps CLAP embeddings and distance-based reward.
+- `src/rl_synth_programmer/agent.py` implements random policy, replay buffer, and DQN.
+- `src/rl_synth_programmer/training.py` contains single-env and batched DQN training plus evaluation.
+- `src/rl_synth_programmer/parallel_rollout.py` contains multiprocessing render workers and the batched rollout coordinator.
+- `src/rl_synth_programmer/smoke.py` contains end-to-end smoke workflows and artifact writers.
+- `src/rl_synth_programmer/cli.py` is the `rl-synth` command-line entrypoint.
+- `tests/` uses small fakes for the host, environment, render pool, and agent so most tests avoid real VST, Torch, or CLAP work.
+
+Generated output normally lives under `artifacts/`. Local CLAP/GPT model files may live under `models/`. These are runtime assets, not source architecture.
+
+## Runtime Workflow
+
+The usual workflow is:
+
+1. Inspect a VST3 plugin with `rl-synth inspect-plugin`.
+2. Generate a target set with `rl-synth generate-target-set`.
+3. Train with `rl-synth train-dqn`.
+4. Evaluate with `rl-synth evaluate`.
+
+`generate-target-set` discovers program/preset states through `SynthHost.enumerate_program_states()`. Each captured target stores:
+
+- a binary preset state in `targets/states/`
+- rendered target audio in `targets/audio/`
+- metadata in `targets/manifest.json` and `targets/manifest.csv`
+
+Training loads that manifest through `TargetPool`, not by scanning the filesystem directly.
+
+## Core Data Model
+
+### Parameters
+
+`ParameterSpec` in `host.py` is the source of truth for synth parameters. It stores stable ID, display name, index, raw default, raw min/max, and flags for automatable/meta parameters.
+
+The environment uses normalized parameter values in `[0, 1]`. `ParameterSpec.denormalize()` converts an action-updated normalized value back to the raw plugin range before assigning `plugin.parameters[stable_id].raw_value`.
+
+Parameter filtering happens in `SynthHost.filter_parameters()`:
+
+- allowlist/denylist are applied first
+- non-automatable and meta parameters are skipped
+- program/preset/bypass/MIDI-CC-like controls are skipped
+
+This filtered list determines both action space size and the parameter snapshot saved in target manifests.
+
+### Targets
+
+`TargetSpec` represents one sound target. It can be synthetic random parameters or a manifest-backed preset:
+
+- `parameters`: normalized parameter snapshot
+- `embedding`: lazily populated target embedding
+- `audio`: lazily populated target audio
+- `preset_state_path`: optional binary preset state path
+- `audio_path`: optional rendered target WAV path
+- `split`: `train`, `val`, or `test`
+
+`TargetPool.maybe_advance()` rotates over training targets with a configurable dwell count. Current switching is `uniform_rotation`.
+
+## Environment Mechanics
+
+`SynthProgrammingEnv` is the single-process Gym-style environment.
+
+On `reset()`:
+
+1. `TargetPool.maybe_advance()` selects the current training target.
+2. The target embedding is computed if needed.
+3. The initial state is sampled.
+4. If manifest presets are available, the start state prefers another preset from the same split, falling back to any other preset.
+5. Otherwise the start state is random normalized parameters.
+6. If the reset starts too close to the target, a small deterministic parameter nudge avoids a zero-distance episode.
+
+On `step(action)`:
+
+1. The discrete action is decoded into `(parameter_id, signed_delta)`.
+2. The selected normalized parameter is clipped into `[0, 1]`.
+3. The host renders a MIDI note.
+4. Audio is embedded.
+5. Distance to target embedding is recomputed.
+6. Reward is either random or `previous_distance - new_distance`.
+7. The episode terminates on `success_threshold` and truncates at `max_episode_steps`.
+
+The observation is:
+
+```text
+[target_embedding, current_embedding, target_embedding - current_embedding, current_normalized_params]
+```
+
+The observation size is only known after the first embedding is available, so `reset()` updates the Gym `observation_space` shape.
+
+## Reward and Embeddings
+
+`RewardConfig.mode` controls reward behavior:
+
+- `random`: no embedder; reward is random and mainly useful for plumbing checks.
+- `clap`: `CLAPEmbedder` embeds rendered audio through `msclap`.
+
+`SimilarityRewardModel` supports:
+
+- `cosine`: `1 - cosine_similarity`
+- `l2`: Euclidean distance
+
+Reward is based on improvement, not absolute similarity:
+
+```text
+reward = previous_distance - new_distance
+```
+
+So positive reward means the rendered sound moved closer to the target embedding.
+
+The CLAP wrapper also supports local/offline model paths used by smoke tests through `models/msclap/` and `models/gpt2/`.
+
+## DQN Agent
+
+`DQNAgent` in `agent.py` contains:
+
+- MLP online network
+- MLP target network
+- Adam optimizer
+- replay buffer
+- epsilon-greedy action selection
+- step-based epsilon decay
+- periodic target-network sync
+
+`ReplayTransition` stores observation, action, reward, next observation, done flag, and target ID. The training loop owns episode bookkeeping and TensorBoard logging; the agent only owns learning state.
+
+## Training Paths
+
+There are two training implementations.
+
+### Single Environment
+
+`train_dqn()` uses one `SynthProgrammingEnv`. It is easier to reason about and remains the default when `--num-workers 1`.
+
+It performs:
+
+1. environment reset
+2. DQN action
+3. environment step
+4. replay insert
+5. one `agent.train_step()`
+6. scalar/text logging
+7. episode reset when terminated/truncated
+
+### Batched Parallel Rollout
+
+`train_dqn_batched()` activates when `--num-workers > 1`.
+
+It splits work into:
+
+- `ParallelRenderPool`: multiprocessing pool where each process owns a loaded VST host
+- `BatchedRolloutCoordinator`: pure coordination of target selection, action decoding, observations, distances, rewards, and slot state
+- one shared CLAP embedder in the parent process
+- one shared DQN learner in the parent process
+
+The design keeps VST rendering parallel while avoiding one CLAP model per worker. Each tick:
+
+1. active slots choose actions
+2. render requests are built
+3. workers render audio in parallel
+4. parent batches CLAP embeddings
+5. coordinator applies rewards and new observations
+6. transitions enter replay
+7. learner performs `updates_per_tick` optimizer updates
+8. completed slots are reset
+
+Target embeddings are precomputed at startup by `_prime_target_embeddings()` so each step only embeds current audio.
+
+## CLI and Artifacts
+
+The CLI always resolves user-facing run folders under `artifacts/`. Passing either `my_run` or `artifacts/my_run` resolves to `artifacts/my_run`.
+
+Expected run layout:
+
+```text
+artifacts/<run>/
+  targets/
+    manifest.json
+    manifest.csv
+    states/
+    audio/
+  train_dqn/
+    dqn_latest.pt
+    tensorboard/
+  smoke_random_env/
+  smoke_train_clap/
+  smoke_evaluate/
+```
+
+The CLI helper functions `_find_manifest()`, `_find_train_checkpoint()`, and `_find_smoke_checkpoint()` enforce the expected workflow and produce user-facing error messages.
+
+## Tests
+
+Install dev dependencies:
+
+```bash
+pip install -e .[dev]
+```
+
+Run all tests:
+
+```bash
+pytest
+```
+
+Most tests patch heavy dependencies with fakes. The code paths that need real VST hosting, CLAP, Torch, and local model files are exercised by smoke commands rather than the default unit tests.
+
+## Common Change Points
+
+- To change action semantics, edit `_decode_action()` in `env.py` and `decode_action()` in `parallel_rollout.py`. Keep them behaviorally identical.
+- To change observation contents, edit `_flatten_observation()` in `env.py` and `flatten_observation()` in `parallel_rollout.py`.
+- To change reward math, edit `SimilarityRewardModel` or the reward branch in both environment/coordinator step application.
+- To change target scheduling, edit `TargetPool`.
+- To add a CLI option, update `_base_parser()`, `_cmd_*`, and `_experiment_config()` if it affects runtime config.
+- To add new training metrics, update both `train_dqn()` and `train_dqn_batched()` when the metric applies to both paths.
+
+## Practical Pitfalls
+
+- The real plugin path must point to an existing `.vst3` instrument.
+- Manifest-backed reset starts from another preset when possible. This is intentional; starting from full random vectors can be less useful for preset-to-preset programming.
+- Target embedding computation may temporarily restore a preset state on the host, then restore the previous host state.
+- The batched path uses `spawn` multiprocessing, so worker functions and request/result objects must stay pickle-friendly.
+- Keep CLAP in the parent process for batched training unless there is a strong reason to pay for one model per render worker.
+- `assert` is used heavily for user-facing validation in this codebase. If the package is ever run with Python optimization (`-O`), those checks disappear.
+
