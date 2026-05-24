@@ -93,6 +93,8 @@ Internal layout under a run folder is:
 
 Console progress bars and stage logs are enabled by default for target generation, training, and evaluation. Use `--no-progress` to reduce live terminal output.
 
+CLAP weights are cached under `clap-weights/`. The code first looks for the required CLAP checkpoint and text model there, and only downloads from Hugging Face when a required local file is missing.
+
 ## Offline Action Dataset and Architecture Sweep
 
 Generate a reusable supervised dataset where each row stores the current observation and the immediate reward for every available action:
@@ -108,7 +110,9 @@ rl-synth generate-action-dataset \
   --render-timeout-seconds 300 \
   --max-state-seconds 90 \
   --shard-size 16 \
-  --reload-workers-every-pair \
+  --reload-workers-every-renders 500 \
+  --preset-render-slowdown-threshold 1.5 \
+  --reload-workers-on-render-slowdown \
   --yes
 
 rl-synth generate-action-dataset \
@@ -121,15 +125,19 @@ rl-synth generate-action-dataset \
   --render-timeout-seconds 300 \
   --max-state-seconds 90 \
   --shard-size 16 \
-  --reload-workers-every-pair \
+  --reload-workers-every-renders 500 \
+  --preset-render-slowdown-threshold 1.5 \
+  --reload-workers-on-render-slowdown \
   --yes
 ```
 
 Long dataset runs write recoverable shards under `<run-folder>/action_dataset/shards/` before the final merged `dataset.npz`.
+Rows are sampled round-robin across target/start preset pairs: move 0 for each pair first, then move 1 for each pair, up to `--moves-per-start` or `--max-states`.
 If a render chunk times out, `--skip-failed-actions` is enabled by default and assigns those actions a large negative reward so the run can continue.
 Use `--no-skip-failed-actions` to abort instead.
 Use `--max-state-seconds` to skip pathological slow start presets and continue with the next target/start pair.
-Render workers are reloaded after each target/start pair by default; use `--no-reload-workers-every-pair` to keep plugin instances alive for speed.
+Render workers are reloaded every 500 successful action renders by default; use `--reload-workers-every-renders 0` to keep plugin instances alive for speed.
+The run detects if a target/start pair render chunk is more than 50% above the prior running mean and reloads workers immediately; use `--no-reload-workers-on-render-slowdown` to assert instead, or `--preset-render-slowdown-threshold 0` to disable this diagnostic.
 
 Preview estimated renders, runtime, and dataset size without writing `dataset.npz`:
 

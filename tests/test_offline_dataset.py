@@ -57,6 +57,8 @@ class FakeRenderPool:
                 audio = np.array([1.0, 0.0], dtype=np.float32)
             elif request.preset_state == b"b":
                 audio = np.array([0.0, 1.0], dtype=np.float32)
+            elif request.preset_state == b"c":
+                audio = np.array([0.5, 0.5], dtype=np.float32)
             else:
                 params = request.parameters or {}
                 audio = np.array(
@@ -83,6 +85,20 @@ class SlowRenderPool(FakeRenderPool):
         _ = timeout_seconds
         if any(request.render_mode == "parameter_state" for request in requests):
             time.sleep(0.02)
+        return super().render_batch(requests)
+
+
+class SlowHighParamRenderPool(FakeRenderPool):
+    def render_batch(self, requests, timeout_seconds=None):
+        _ = timeout_seconds
+        if any(
+            request.render_mode == "parameter_state"
+            and request.parameters is not None
+            and float(request.parameters.get("cutoff", 0.0)) > 0.8
+            and float(request.parameters.get("resonance", 0.0)) > 0.8
+            for request in requests
+        ):
+            time.sleep(0.01)
         return super().render_batch(requests)
 
 
@@ -131,6 +147,44 @@ def _write_manifest(root: Path) -> Path:
     return path
 
 
+def _write_three_manifest(root: Path) -> Path:
+    (root / "states").mkdir(parents=True)
+    state_a = root / "states/a.bin"
+    state_b = root / "states/b.bin"
+    state_c = root / "states/c.bin"
+    state_a.write_bytes(b"a")
+    state_b.write_bytes(b"b")
+    state_c.write_bytes(b"c")
+    manifest = {
+        "targets": [
+            {
+                "target_id": "a",
+                "split": "train",
+                "label": "A",
+                "parameter_snapshot": {"cutoff": 1.0, "resonance": 0.0},
+                "preset_state_path": str(state_a),
+            },
+            {
+                "target_id": "b",
+                "split": "train",
+                "label": "B",
+                "parameter_snapshot": {"cutoff": 0.0, "resonance": 1.0},
+                "preset_state_path": str(state_b),
+            },
+            {
+                "target_id": "c",
+                "split": "train",
+                "label": "C",
+                "parameter_snapshot": {"cutoff": 0.9, "resonance": 0.9},
+                "preset_state_path": str(state_c),
+            },
+        ]
+    }
+    path = root / "manifest.json"
+    path.write_text(json.dumps(manifest))
+    return path
+
+
 class OfflineDatasetTests(unittest.TestCase):
     def test_estimate_action_dataset_does_not_write_dataset(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -142,6 +196,7 @@ class OfflineDatasetTests(unittest.TestCase):
                 output_dir=root,
                 max_states=2,
                 moves_per_start=1,
+                preset_render_slowdown_threshold=0.0,
             )
             with patch("rl_synth_programmer.offline_dataset.SynthHost", FakeHost):
                 with patch("rl_synth_programmer.offline_dataset.ParallelRenderPool", FakeRenderPool):
@@ -185,6 +240,38 @@ class OfflineDatasetTests(unittest.TestCase):
             self.assertEqual(metadata["shapes"]["action_rewards"], [2, 4])
             self.assertTrue((root / "action_dataset" / "shards" / "shard-00000.npz").exists())
 
+    def test_generate_action_dataset_samples_pairs_round_robin(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest_path = _write_manifest(root)
+            config = ActionDatasetConfig(
+                plugin_path=Path("dummy.vst3"),
+                manifest_path=manifest_path,
+                output_dir=root,
+                max_states=3,
+                moves_per_start=2,
+                preset_render_slowdown_threshold=0.0,
+            )
+            estimate = {
+                "estimated_total_renders": 15,
+                "sample_states": 3,
+                "action_count": 4,
+                "observation_size": 8,
+                "seconds_per_state": 0.01,
+                "estimated_seconds": 0.03,
+                "estimated_npz_bytes": 100,
+            }
+            with patch("rl_synth_programmer.offline_dataset.SynthHost", FakeHost):
+                with patch("rl_synth_programmer.offline_dataset.ParallelRenderPool", FakeRenderPool):
+                    with patch("rl_synth_programmer.offline_dataset.build_embedder", return_value=FakeEmbedder()):
+                        result = generate_action_dataset(config, progress=False, yes=True, estimate=estimate)
+            dataset = np.load(result["dataset_path"])
+            self.assertEqual(dataset["target_indices"].tolist(), [0, 1, 0])
+            self.assertEqual(dataset["start_indices"].tolist(), [1, 0, 1])
+            self.assertEqual(dataset["move_indices"].tolist(), [0, 0, 1])
+            metadata = json.loads(Path(result["metadata_path"]).read_text())
+            self.assertEqual(metadata["sampling_scheme"], "round_robin_greedy")
+
     def test_generate_action_dataset_marks_timed_out_actions_failed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -198,6 +285,7 @@ class OfflineDatasetTests(unittest.TestCase):
                 render_timeout_seconds=0.01,
                 render_chunk_size=1,
                 failed_action_reward=-123.0,
+                preset_render_slowdown_threshold=0.0,
             )
             estimate = {
                 "estimated_total_renders": 5,
@@ -231,6 +319,7 @@ class OfflineDatasetTests(unittest.TestCase):
                 render_chunk_size=1,
                 max_state_seconds=0.01,
                 failed_action_reward=-123.0,
+                preset_render_slowdown_threshold=0.0,
             )
             estimate = {
                 "estimated_total_renders": 5,
@@ -251,7 +340,7 @@ class OfflineDatasetTests(unittest.TestCase):
             summary = json.loads(Path(result["summary_path"]).read_text())
             self.assertEqual(summary["skipped_state_count"], 1)
 
-    def test_generate_action_dataset_reloads_workers_between_pairs_by_default(self) -> None:
+    def test_generate_action_dataset_reloads_workers_after_render_count(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             manifest_path = _write_manifest(root)
@@ -262,6 +351,8 @@ class OfflineDatasetTests(unittest.TestCase):
                 max_states=2,
                 moves_per_start=1,
                 shard_size=1,
+                reload_workers_every_renders=3,
+                preset_render_slowdown_threshold=0.0,
             )
             estimate = {
                 "estimated_total_renders": 10,
@@ -278,10 +369,43 @@ class OfflineDatasetTests(unittest.TestCase):
                 with patch("rl_synth_programmer.offline_dataset.ParallelRenderPool", CountingRenderPool):
                     with patch("rl_synth_programmer.offline_dataset.build_embedder", return_value=FakeEmbedder()):
                         result = generate_action_dataset(config, progress=False, yes=True, estimate=estimate)
-            self.assertGreaterEqual(CountingRenderPool.opened, 3)
+            self.assertGreaterEqual(CountingRenderPool.opened, 2)
             self.assertEqual(CountingRenderPool.opened, CountingRenderPool.closed)
             metadata = json.loads(Path(result["metadata_path"]).read_text())
-            self.assertTrue(metadata["args"]["reload_workers_every_pair"])
+            self.assertEqual(metadata["args"]["reload_workers_every_renders"], 3)
+
+    def test_generate_action_dataset_asserts_on_preset_render_slowdown(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest_path = _write_three_manifest(root)
+            config = ActionDatasetConfig(
+                plugin_path=Path("dummy.vst3"),
+                manifest_path=manifest_path,
+                output_dir=root,
+                max_states=2,
+                moves_per_start=1,
+                render_chunk_size=1,
+                preset_render_slowdown_threshold=1.1,
+                reload_workers_on_render_slowdown=False,
+            )
+            estimate = {
+                "estimated_total_renders": 20,
+                "sample_states": 2,
+                "action_count": 4,
+                "observation_size": 8,
+                "seconds_per_state": 0.01,
+                "estimated_seconds": 0.02,
+                "estimated_npz_bytes": 100,
+            }
+            with patch("rl_synth_programmer.offline_dataset.SynthHost", FakeHost):
+                with patch("rl_synth_programmer.offline_dataset.ParallelRenderPool", SlowHighParamRenderPool):
+                    with patch("rl_synth_programmer.offline_dataset.build_embedder", return_value=FakeEmbedder()):
+                        with self.assertRaises(AssertionError) as ctx:
+                            generate_action_dataset(config, progress=False, yes=True, estimate=estimate)
+            message = str(ctx.exception)
+            self.assertIn("Preset render slowdown detected", message)
+            self.assertIn("target=a", message)
+            self.assertIn("start=c", message)
 
     def test_generate_action_dataset_requires_confirmation_for_large_estimate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

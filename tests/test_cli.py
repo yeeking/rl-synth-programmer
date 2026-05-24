@@ -91,7 +91,9 @@ class CliLoggingOptionsTest(unittest.TestCase):
         self.assertEqual(args.shard_size, 16)
         self.assertEqual(args.render_chunk_size, 0)
         self.assertIsNone(args.max_state_seconds)
-        self.assertTrue(args.reload_workers_every_pair)
+        self.assertEqual(args.reload_workers_every_renders, 500)
+        self.assertEqual(args.preset_render_slowdown_threshold, 1.5)
+        self.assertTrue(args.reload_workers_on_render_slowdown)
         self.assertTrue(args.progress)
 
     def test_compare_architectures_parser_defaults(self) -> None:

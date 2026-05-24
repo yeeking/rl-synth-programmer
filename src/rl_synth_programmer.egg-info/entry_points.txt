@@ -1,0 +1,2 @@
+[console_scripts]
+rl-synth = rl_synth_programmer.cli:main

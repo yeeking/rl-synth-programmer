@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import resource
 from time import perf_counter
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
@@ -27,8 +27,9 @@ class ActionDatasetConfig:
     manifest_path: target manifest produced by generate-target-set.
     output_dir: run folder where action_dataset/ artifacts are written.
     reward_mode: reward backend; v1 supports CLAP-backed distance rewards.
-    max_states: maximum dataset rows to generate. one row is values for all parameter tweaks from a given position in terms of how much closer you get from that position to a target position when you make a given parameter tweak
-    moves_per_start: greedy best-action steps to collect from each target/start preset pair.
+    max_states: maximum dataset rows to generate.
+    moves_per_start: maximum greedy best-action rounds to collect for each target/start preset pair.
+        Generation visits one move per pair per round so small max_states values cover more presets first.
     num_workers: number of parallel render worker processes.
     clap_batch_size: number of rendered audio buffers embedded per CLAP batch.
     action_step: normalized parameter delta used by each +/- action.
@@ -39,7 +40,11 @@ class ActionDatasetConfig:
     shard_size: write a recoverable shard after this many generated rows.
     render_chunk_size: actions per render batch; 0 means use num_workers.
     max_state_seconds: skip the rest of a state after this many seconds; None disables it.
-    reload_workers_every_pair: reload plugin worker processes after each target/start pair.
+    reload_workers_every_renders: reload plugin worker processes after this many successful action renders.
+    preset_render_slowdown_threshold: assert if a row's mean action render time exceeds the
+        prior running mean by this multiplier. Use 0 to disable.
+    reload_workers_on_render_slowdown: reload workers immediately when one render chunk crosses
+        preset_render_slowdown_threshold. If false, assert at the first slow chunk.
     """
 
     plugin_path: Path
@@ -58,7 +63,18 @@ class ActionDatasetConfig:
     shard_size: int = 16
     render_chunk_size: int = 0
     max_state_seconds: float | None = None
-    reload_workers_every_pair: bool = True
+    reload_workers_every_renders: int = 500
+    preset_render_slowdown_threshold: float = 1.5
+    reload_workers_on_render_slowdown: bool = True
+
+
+@dataclass(slots=True)
+class _PairRolloutState:
+    params: dict[str, float]
+    embedding: np.ndarray
+    distance: float
+    observation: np.ndarray
+    active: bool = True
 
 
 def _memory_snapshot() -> dict[str, float | str]:
@@ -193,7 +209,12 @@ def _evaluate_all_actions(
     state_number: int | None = None,
     deadline: float | None = None,
     render_progress=None,
-) -> tuple[np.ndarray, list[dict[str, float]], list[np.ndarray], list[float], list[int]]:
+    reload_after_rendered: Callable[[int, Any], Any] | None = None,
+    render_slowdown_baseline: float | None = None,
+    render_slowdown_threshold: float = 0.0,
+    render_slowdown_context: str = "",
+    reload_on_render_slowdown: Callable[[Any], Any] | None = None,
+) -> tuple[np.ndarray, list[dict[str, float]], list[np.ndarray], list[float], list[int], float, int, int]:
     assert target.embedding is not None, f"Target {target.target_id} has no embedding."
     requests: list[RenderRequest] = []
     next_params_list: list[dict[str, float]] = []
@@ -208,6 +229,9 @@ def _evaluate_all_actions(
     distances = [float("nan")] * len(requests)
     next_embeddings = [np.zeros_like(target.embedding, dtype=np.float32) for _ in requests]
     failed_actions: list[int] = []
+    render_seconds = 0.0
+    rendered_action_count = 0
+    slow_render_chunk_count = 0
     for start in range(0, len(requests), max(1, chunk_size)):
         if deadline is not None and perf_counter() >= deadline:
             action_ids = [request.slot_id for request in requests[start:]]
@@ -239,6 +263,32 @@ def _evaluate_all_actions(
             if render_progress is not None:
                 render_progress.update(len(action_ids))
             continue
+        chunk_render_seconds = perf_counter() - render_started
+        render_seconds += chunk_render_seconds
+        rendered_action_count += len(results)
+        reloaded_after_slowdown = False
+        chunk_mean_seconds = float(chunk_render_seconds / max(1, len(results)))
+        if (
+            render_slowdown_baseline is not None
+            and float(render_slowdown_baseline) > 0.0
+            and float(render_slowdown_threshold) > 0.0
+            and chunk_mean_seconds > float(render_slowdown_baseline) * float(render_slowdown_threshold)
+        ):
+            action_ids = [request.slot_id for request in request_chunk]
+            message = (
+                "Preset render slowdown detected: "
+                f"{render_slowdown_context} "
+                f"actions={action_ids[0]}-{action_ids[-1]} "
+                f"chunk_mean_seconds_per_action={chunk_mean_seconds:.6f} "
+                f"baseline_mean_seconds_per_action={float(render_slowdown_baseline):.6f} "
+                f"threshold_multiplier={float(render_slowdown_threshold):.3f}"
+            )
+            slow_render_chunk_count += 1
+            if reload_on_render_slowdown is None:
+                raise AssertionError(message)
+            stage_log(message + ". Reloading render workers.")
+            render_pool = reload_on_render_slowdown(render_pool)
+            reloaded_after_slowdown = True
         embeddings = embed_audio_batch(
             embedder,
             [result.audio for result in results],
@@ -255,9 +305,20 @@ def _evaluate_all_actions(
             next_embeddings[action_id] = next_embedding
         if render_progress is not None:
             render_progress.update(len(results))
+        if reload_after_rendered is not None and not reloaded_after_slowdown:
+            render_pool = reload_after_rendered(len(results), render_pool)
     if not np.any(rewards > float(failed_action_reward)):
         raise RuntimeError(f"All action renders failed for target={target.target_id} state={state_number}.")
-    return rewards, next_params_list, next_embeddings, distances, failed_actions
+    return (
+        rewards,
+        next_params_list,
+        next_embeddings,
+        distances,
+        failed_actions,
+        render_seconds,
+        rendered_action_count,
+        slow_render_chunk_count,
+    )
 
 
 def estimate_action_dataset(config: ActionDatasetConfig, *, progress: bool = True) -> dict[str, Any]:
@@ -292,7 +353,16 @@ def estimate_action_dataset(config: ActionDatasetConfig, *, progress: bool = Tru
             timeout_seconds=config.render_timeout_seconds,
         )
         started = perf_counter()
-        rewards, _params_list, _embeddings, _distances, _failed_actions = _evaluate_all_actions(
+        (
+            rewards,
+            _params_list,
+            _embeddings,
+            _distances,
+            _failed_actions,
+            _render_seconds,
+            _rendered_count,
+            _slow_render_chunk_count,
+        ) = _evaluate_all_actions(
             coordinator,
             render_pool,
             embedder,
@@ -327,6 +397,10 @@ def estimate_action_dataset(config: ActionDatasetConfig, *, progress: bool = Tru
         "clap_batch_size": int(config.clap_batch_size),
         "render_timeout_seconds": config.render_timeout_seconds,
         "max_state_seconds": config.max_state_seconds,
+        "reload_workers_every_renders": int(config.reload_workers_every_renders),
+        "preset_render_slowdown_threshold": float(config.preset_render_slowdown_threshold),
+        "reload_workers_on_render_slowdown": bool(config.reload_workers_on_render_slowdown),
+        "sampling_scheme": "round_robin_greedy",
         "memory": _memory_snapshot(),
     }
     stage_log(
@@ -366,6 +440,14 @@ def _summary_from_arrays(arrays: dict[str, np.ndarray], target_ids: list[str], a
     target_indices = np.asarray(arrays["target_indices"], dtype=np.int32)
     failed_counts = np.asarray(arrays.get("failed_action_counts", np.zeros((rewards.shape[0],), dtype=np.int32)), dtype=np.int32)
     skipped_states = np.asarray(arrays.get("state_skipped", np.zeros((rewards.shape[0],), dtype=np.int32)), dtype=np.int32)
+    slow_chunk_counts = np.asarray(
+        arrays.get("slow_render_chunk_counts", np.zeros((rewards.shape[0],), dtype=np.int32)),
+        dtype=np.int32,
+    )
+    mean_render_seconds = np.asarray(
+        arrays.get("mean_render_seconds_per_action", np.zeros((rewards.shape[0],), dtype=np.float32)),
+        dtype=np.float32,
+    )
     per_target_counts = {
         target_id: int(np.sum(target_indices == index))
         for index, target_id in enumerate(target_ids)
@@ -384,6 +466,10 @@ def _summary_from_arrays(arrays: dict[str, np.ndarray], target_ids: list[str], a
         "failed_action_count": int(np.sum(failed_counts)),
         "rows_with_failed_actions": int(np.sum(failed_counts > 0)),
         "skipped_state_count": int(np.sum(skipped_states > 0)),
+        "mean_render_seconds_per_action": float(np.mean(mean_render_seconds)),
+        "max_render_seconds_per_action": float(np.max(mean_render_seconds)),
+        "slow_render_chunk_count": int(np.sum(slow_chunk_counts)),
+        "rows_with_slow_render_chunks": int(np.sum(slow_chunk_counts > 0)),
         "per_target_counts": per_target_counts,
     }
 
@@ -400,6 +486,9 @@ def _empty_rows() -> dict[str, list[Any]]:
         "best_rewards": [],
         "failed_action_counts": [],
         "state_skipped": [],
+        "render_seconds": [],
+        "mean_render_seconds_per_action": [],
+        "slow_render_chunk_counts": [],
     }
 
 
@@ -415,6 +504,9 @@ def _arrays_from_rows(rows: dict[str, list[Any]]) -> dict[str, np.ndarray]:
         "best_rewards": np.asarray(rows["best_rewards"], dtype=np.float32),
         "failed_action_counts": np.asarray(rows["failed_action_counts"], dtype=np.int32),
         "state_skipped": np.asarray(rows["state_skipped"], dtype=np.int32),
+        "render_seconds": np.asarray(rows["render_seconds"], dtype=np.float32),
+        "mean_render_seconds_per_action": np.asarray(rows["mean_render_seconds_per_action"], dtype=np.float32),
+        "slow_render_chunk_counts": np.asarray(rows["slow_render_chunk_counts"], dtype=np.int32),
     }
 
 
@@ -478,8 +570,30 @@ def generate_action_dataset(
     shard_paths: list[Path] = []
     shard_index = 0
     total_written_rows = 0
+    successful_renders_since_reload = 0
+    render_mean_history: list[float] = []
     started = perf_counter()
     render_pool = _open_render_pool(env_config.host, config.num_workers)
+
+    def _reload_after_rendered(rendered_count: int, current_pool):
+        nonlocal successful_renders_since_reload, render_pool
+        if int(config.reload_workers_every_renders) <= 0:
+            return current_pool
+        successful_renders_since_reload += int(rendered_count)
+        if successful_renders_since_reload < int(config.reload_workers_every_renders):
+            return current_pool
+        _close_render_pool(current_pool)
+        successful_renders_since_reload = 0
+        render_pool = _open_render_pool(env_config.host, config.num_workers)
+        return render_pool
+
+    def _reload_render_pool_now(current_pool):
+        nonlocal successful_renders_since_reload, render_pool
+        _close_render_pool(current_pool)
+        successful_renders_since_reload = 0
+        render_pool = _open_render_pool(env_config.host, config.num_workers)
+        return render_pool
+
     try:
         _prime_target_embeddings(
             coordinator,
@@ -489,9 +603,6 @@ def generate_action_dataset(
             progress=progress,
             timeout_seconds=config.render_timeout_seconds,
         )
-        if config.reload_workers_every_pair:
-            _close_render_pool(render_pool)
-            render_pool = _open_render_pool(env_config.host, config.num_workers)
         targets = coordinator.curriculum.all_targets()
         pairs = _target_start_pairs(targets)
         assert pairs, "Manifest must contain at least two preset-state targets for preset-pair dataset generation."
@@ -499,35 +610,56 @@ def generate_action_dataset(
         total_states = _sample_state_count(config, pairs)
         total_action_renders = total_states * int(coordinator.action_size)
         progress_bar = make_progress_bar(total=total_action_renders, desc="action renders", enabled=progress)
-        for target_index, start_index in pairs:
+        pair_states: dict[int, _PairRolloutState] = {}
+        for move_index in range(config.moves_per_start):
             if total_written_rows + len(rows["observations"]) >= total_states:
                 break
-            target = targets[target_index]
-            start = targets[start_index]
-            current_params, current_embedding, current_distance, observation = _render_start_state(
-                coordinator,
-                render_pool,
-                embedder,
-                target,
-                start,
-                batch_size=config.clap_batch_size,
-                timeout_seconds=config.render_timeout_seconds,
-            )
-            for move_index in range(config.moves_per_start):
-                current_row_number = total_written_rows + len(rows["observations"]) + 1
-                if current_row_number > total_states:
+            for pair_index, (target_index, start_index) in enumerate(pairs):
+                if total_written_rows + len(rows["observations"]) >= total_states:
                     break
+                target = targets[target_index]
+                start = targets[start_index]
+                pair_state = pair_states.get(pair_index)
+                if pair_state is None:
+                    current_params, current_embedding, current_distance, observation = _render_start_state(
+                        coordinator,
+                        render_pool,
+                        embedder,
+                        target,
+                        start,
+                        batch_size=config.clap_batch_size,
+                        timeout_seconds=config.render_timeout_seconds,
+                    )
+                    pair_state = _PairRolloutState(
+                        params=current_params,
+                        embedding=current_embedding,
+                        distance=current_distance,
+                        observation=observation,
+                    )
+                    pair_states[pair_index] = pair_state
+                if not pair_state.active:
+                    continue
+                current_row_number = total_written_rows + len(rows["observations"]) + 1
                 state_started = perf_counter()
                 deadline = None
                 if config.max_state_seconds is not None and float(config.max_state_seconds) > 0.0:
                     deadline = state_started + float(config.max_state_seconds)
-                rewards, next_params_list, next_embeddings, next_distances, failed_actions = _evaluate_all_actions(
+                (
+                    rewards,
+                    next_params_list,
+                    next_embeddings,
+                    next_distances,
+                    failed_actions,
+                    render_seconds,
+                    rendered_action_count,
+                    slow_render_chunk_count,
+                ) = _evaluate_all_actions(
                     coordinator,
                     render_pool,
                     embedder,
                     target,
-                    current_params,
-                    current_distance,
+                    pair_state.params,
+                    pair_state.distance,
                     batch_size=config.clap_batch_size,
                     timeout_seconds=config.render_timeout_seconds,
                     skip_failed_actions=config.skip_failed_actions,
@@ -536,17 +668,47 @@ def generate_action_dataset(
                     state_number=current_row_number,
                     deadline=deadline,
                     render_progress=progress_bar,
+                    reload_after_rendered=_reload_after_rendered,
+                    render_slowdown_baseline=float(np.mean(render_mean_history)) if render_mean_history else None,
+                    render_slowdown_threshold=float(config.preset_render_slowdown_threshold),
+                    render_slowdown_context=(
+                        f"target={target.target_id} start={start.target_id} "
+                        f"target_index={target_index} start_index={start_index} "
+                        f"move={move_index} state={current_row_number}/{total_states}"
+                    ),
+                    reload_on_render_slowdown=_reload_render_pool_now
+                    if bool(config.reload_workers_on_render_slowdown)
+                    else None,
                 )
                 best_action = int(np.argmax(rewards))
+                mean_render_seconds_per_action = float(render_seconds / max(1, rendered_action_count))
+                if (
+                    float(config.preset_render_slowdown_threshold) > 0.0
+                    and render_mean_history
+                    and rendered_action_count > 0
+                    and slow_render_chunk_count == 0
+                ):
+                    baseline = float(np.mean(render_mean_history))
+                    allowed = baseline * float(config.preset_render_slowdown_threshold)
+                    assert mean_render_seconds_per_action <= allowed, (
+                        "Preset render slowdown detected: "
+                        f"target={target.target_id} start={start.target_id} "
+                        f"target_index={target_index} start_index={start_index} "
+                        f"move={move_index} state={current_row_number}/{total_states} "
+                        f"mean_render_seconds_per_action={mean_render_seconds_per_action:.6f} "
+                        f"baseline_mean_seconds_per_action={baseline:.6f} "
+                        f"threshold_multiplier={float(config.preset_render_slowdown_threshold):.3f} "
+                        f"rendered_actions={rendered_action_count} failed_actions={len(failed_actions)}"
+                    )
                 state_skipped = int(
                     config.max_state_seconds is not None
                     and float(config.max_state_seconds) > 0.0
                     and perf_counter() >= state_started + float(config.max_state_seconds)
                     and len(failed_actions) > 0
                 )
-                rows["observations"].append(np.asarray(observation, dtype=np.float32))
+                rows["observations"].append(np.asarray(pair_state.observation, dtype=np.float32))
                 rows["action_rewards"].append(rewards)
-                rows["current_distances"].append(float(current_distance))
+                rows["current_distances"].append(float(pair_state.distance))
                 rows["target_indices"].append(int(target_index))
                 rows["start_indices"].append(int(start_index))
                 rows["move_indices"].append(int(move_index))
@@ -554,17 +716,27 @@ def generate_action_dataset(
                 rows["best_rewards"].append(float(rewards[best_action]))
                 rows["failed_action_counts"].append(len(failed_actions))
                 rows["state_skipped"].append(state_skipped)
+                rows["render_seconds"].append(float(render_seconds))
+                rows["mean_render_seconds_per_action"].append(mean_render_seconds_per_action)
+                rows["slow_render_chunk_counts"].append(int(slow_render_chunk_count))
+                if rendered_action_count > 0 and not state_skipped:
+                    render_mean_history.append(mean_render_seconds_per_action)
                 if state_skipped:
                     stage_log(
                         f"Skipping slow state {current_row_number}/{total_states}: "
                         f"target={target.target_id} start={start.target_id} "
                         f"elapsed={perf_counter() - state_started:.2f}s failed_actions={len(failed_actions)}."
                     )
+                    pair_state.active = False
                 else:
-                    current_params = next_params_list[best_action]
-                    current_embedding = next_embeddings[best_action]
-                    current_distance = next_distances[best_action]
-                    observation = coordinator.flatten_observation(current_embedding, target.embedding, current_params)
+                    pair_state.params = next_params_list[best_action]
+                    pair_state.embedding = next_embeddings[best_action]
+                    pair_state.distance = next_distances[best_action]
+                    pair_state.observation = coordinator.flatten_observation(
+                        pair_state.embedding,
+                        target.embedding,
+                        pair_state.params,
+                    )
                 if failed_actions:
                     stage_log(
                         f"State {current_row_number}/{total_states} completed with "
@@ -584,11 +756,6 @@ def generate_action_dataset(
                         total_written_rows += len(rows["observations"])
                         shard_index += 1
                         rows = _empty_rows()
-                if state_skipped:
-                    break
-            if config.reload_workers_every_pair and total_written_rows + len(rows["observations"]) < total_states:
-                _close_render_pool(render_pool)
-                render_pool = _open_render_pool(env_config.host, config.num_workers)
         progress_bar.close()
     finally:
         _close_render_pool(render_pool)
@@ -624,6 +791,7 @@ def generate_action_dataset(
         "shapes": {key: list(value.shape) for key, value in arrays.items()},
         "dtypes": {key: str(value.dtype) for key, value in arrays.items()},
         "generation_seconds": float(perf_counter() - started),
+        "sampling_scheme": "round_robin_greedy",
         "memory": _memory_snapshot(),
         "estimate": estimate,
         "args": {
@@ -638,7 +806,9 @@ def generate_action_dataset(
             "shard_size": int(config.shard_size),
             "render_chunk_size": int(config.render_chunk_size or config.num_workers),
             "max_state_seconds": config.max_state_seconds,
-            "reload_workers_every_pair": bool(config.reload_workers_every_pair),
+            "reload_workers_every_renders": int(config.reload_workers_every_renders),
+            "preset_render_slowdown_threshold": float(config.preset_render_slowdown_threshold),
+            "reload_workers_on_render_slowdown": bool(config.reload_workers_on_render_slowdown),
         },
         "shards": [str(path) for path in shard_paths],
     }

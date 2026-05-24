@@ -10,6 +10,8 @@ import yaml
 from .config import RewardConfig
 from .optional_deps import require_dependency
 
+CLAP_WEIGHTS_DIR = Path("clap-weights")
+
 
 class AudioEmbedder(Protocol):
     def embed_audio(self, audio: np.ndarray, sample_rate: int) -> np.ndarray:
@@ -38,9 +40,73 @@ class CLAPEmbedder:
     def __init__(self, config: RewardConfig):
         self.config = config
         msclap = require_dependency("msclap", "ml")
-        model_fp = None if config.clap_checkpoint is None else str(config.clap_checkpoint)
-        text_model_path = None if config.clap_text_model_path is None else str(config.clap_text_model_path)
+        wrapper_mod = require_dependency("msclap.CLAPWrapper", "ml")
+        model_fp, text_model_path = self._resolve_clap_assets(config, wrapper_mod)
         self._model = self._build_model(msclap, model_fp, config.clap_version, text_model_path)
+
+    @staticmethod
+    def _resolve_clap_assets(config: RewardConfig, wrapper_mod) -> tuple[str, str]:
+        checkpoint = CLAPEmbedder._resolve_clap_checkpoint(config, wrapper_mod)
+        text_model_path = CLAPEmbedder._resolve_text_model_path(config, wrapper_mod)
+        return str(checkpoint), str(text_model_path)
+
+    @staticmethod
+    def _resolve_clap_checkpoint(config: RewardConfig, wrapper_mod) -> Path:
+        if config.clap_checkpoint is not None:
+            checkpoint = Path(config.clap_checkpoint)
+            assert checkpoint.exists(), f"CLAP checkpoint path does not exist: {checkpoint}"
+            return checkpoint
+
+        model_names = wrapper_mod.CLAPWrapper.model_name
+        if config.clap_version not in model_names:
+            raise ValueError(f"Unsupported CLAP version: {config.clap_version}")
+        weights_dir = CLAP_WEIGHTS_DIR
+        weights_dir.mkdir(parents=True, exist_ok=True)
+        checkpoint = weights_dir / model_names[config.clap_version]
+        if checkpoint.exists():
+            return checkpoint
+
+        hf_hub_download = require_dependency("huggingface_hub.file_download", "ml").hf_hub_download
+        downloaded = hf_hub_download(
+            repo_id=wrapper_mod.CLAPWrapper.model_repo,
+            filename=model_names[config.clap_version],
+            local_dir=str(weights_dir),
+        )
+        downloaded_path = Path(downloaded)
+        assert downloaded_path.exists(), f"Downloaded CLAP checkpoint was not written: {downloaded_path}"
+        return downloaded_path
+
+    @staticmethod
+    def _resolve_text_model_path(config: RewardConfig, wrapper_mod) -> Path:
+        if config.clap_text_model_path is not None:
+            text_model_path = Path(config.clap_text_model_path)
+            assert text_model_path.exists(), f"CLAP text model path does not exist: {text_model_path}"
+            return text_model_path
+
+        config_path = Path(wrapper_mod.__file__).parent / f"configs/config_{config.clap_version}.yml"
+        config_data = yaml.safe_load(config_path.read_text())
+        text_model_name = str(
+            config_data.get("text_decoder") if "clapcap" in config.clap_version else config_data.get("text_model")
+        )
+        assert text_model_name, f"Could not determine CLAP text model for version {config.clap_version}."
+        text_model_path = CLAP_WEIGHTS_DIR / text_model_name.replace("/", "__")
+        has_config = (text_model_path / "config.json").exists()
+        has_model = (text_model_path / "pytorch_model.bin").exists() or (text_model_path / "model.safetensors").exists()
+        has_tokenizer = (text_model_path / "tokenizer_config.json").exists()
+        if has_config and has_model and has_tokenizer:
+            return text_model_path
+
+        CLAP_WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
+        text_model_path.mkdir(parents=True, exist_ok=True)
+        transformers = require_dependency("transformers", "ml")
+        tokenizer = transformers.AutoTokenizer.from_pretrained(text_model_name)
+        if "clapcap" in config.clap_version:
+            model = transformers.GPT2LMHeadModel.from_pretrained(text_model_name)
+        else:
+            model = transformers.AutoModel.from_pretrained(text_model_name)
+        tokenizer.save_pretrained(text_model_path)
+        model.save_pretrained(text_model_path)
+        return text_model_path
 
     @staticmethod
     def _build_model(msclap, model_fp: str | None, version: str, text_model_path: str | None):
@@ -65,6 +131,8 @@ class CLAPEmbedder:
         config_path = Path(wrapper_mod.__file__).parent / f"configs/config_{version}.yml"
         config_data = yaml.safe_load(config_path.read_text())
         config_data["text_model"] = text_model_path
+        if "clapcap" in version:
+            config_data["text_decoder"] = text_model_path
         wrapper.config_as_str = yaml.safe_dump(config_data)
         wrapper.model_fp = model_fp
         wrapper.use_cuda = False
@@ -140,7 +208,4 @@ class SimilarityRewardModel:
 def build_embedder(config: RewardConfig) -> AudioEmbedder | None:
     if config.mode != "clap":
         return None
-    if config.clap_checkpoint is not None:
-        checkpoint = Path(config.clap_checkpoint)
-        assert checkpoint.exists(), f"CLAP checkpoint path does not exist: {checkpoint}"
     return CLAPEmbedder(config)

@@ -312,10 +312,22 @@ def _base_parser() -> argparse.ArgumentParser:
         help="Skip a dataset state after this many seconds and move to the next target/start pair. Default: disabled.",
     )
     dataset_parser.add_argument(
-        "--reload-workers-every-pair",
+        "--reload-workers-every-renders",
+        type=int,
+        default=500,
+        help="Reload render-worker plugin instances after this many successful action renders. Use 0 to disable. Default: 500.",
+    )
+    dataset_parser.add_argument(
+        "--preset-render-slowdown-threshold",
+        type=float,
+        default=1.5,
+        help="Assert if a preset pair's mean action render time exceeds the prior running mean by this multiplier. Use 0 to disable. Default: 1.5.",
+    )
+    dataset_parser.add_argument(
+        "--reload-workers-on-render-slowdown",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Reload render-worker plugin instances after each target/start preset pair. Default: enabled.",
+        help="Reload render workers immediately when a render chunk crosses the slowdown threshold. Default: enabled.",
     )
     dataset_parser.add_argument(
         "--progress",
@@ -776,7 +788,9 @@ def _cmd_generate_action_dataset(
     shard_size: int,
     render_chunk_size: int,
     max_state_seconds: float | None,
-    reload_workers_every_pair: bool,
+    reload_workers_every_renders: int,
+    preset_render_slowdown_threshold: float,
+    reload_workers_on_render_slowdown: bool,
 ) -> None:
     run_root = _resolve_run_folder(run_folder, create=True)
     manifest_path = _find_manifest(run_root)
@@ -794,7 +808,9 @@ def _cmd_generate_action_dataset(
         shard_size=shard_size,
         render_chunk_size=render_chunk_size,
         max_state_seconds=max_state_seconds,
-        reload_workers_every_pair=reload_workers_every_pair,
+        reload_workers_every_renders=reload_workers_every_renders,
+        preset_render_slowdown_threshold=preset_render_slowdown_threshold,
+        reload_workers_on_render_slowdown=reload_workers_on_render_slowdown,
     )
     estimate = estimate_action_dataset(config, progress=progress)
     if estimate_only:
@@ -887,7 +903,9 @@ def main() -> None:
             args.shard_size,
             args.render_chunk_size,
             args.max_state_seconds,
-            args.reload_workers_every_pair,
+            args.reload_workers_every_renders,
+            args.preset_render_slowdown_threshold,
+            args.reload_workers_on_render_slowdown,
         )
     elif args.command == "compare-architectures":
         _cmd_compare_architectures(
