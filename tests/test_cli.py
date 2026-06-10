@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -9,7 +10,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from rl_synth_programmer.cli import _base_parser, _find_manifest, _resolve_run_folder
+from rl_synth_programmer.cli import _base_parser, _find_manifest, _resolve_run_folder, _validate_args
 
 
 class CliLoggingOptionsTest(unittest.TestCase):
@@ -115,6 +116,17 @@ class CliLoggingOptionsTest(unittest.TestCase):
         self.assertTrue(args.progress)
         self.assertFalse(args.tensorboard)
 
+    def test_search_feature_change_models_parser_defaults(self) -> None:
+        parser = _base_parser()
+        args = parser.parse_args(["search-feature-change-models"])
+        self.assertIsNone(args.dataset)
+        self.assertEqual(args.artifacts_root, "artifacts")
+        self.assertIsNone(args.config)
+        self.assertEqual(args.out_dir, "architecture_search/feature_change")
+        self.assertEqual(args.epochs, 5)
+        self.assertTrue(args.progress)
+        self.assertFalse(args.tensorboard)
+
     def test_smoke_train_parser_accepts_disable_flags(self) -> None:
         parser = _base_parser()
         args = parser.parse_args(
@@ -170,6 +182,37 @@ class CliLoggingOptionsTest(unittest.TestCase):
         with self.assertRaises(AssertionError) as ctx:
             _find_manifest(run_root)
         self.assertIn("Did you run generate-target-set", str(ctx.exception))
+
+    def test_cli_validation_rejects_missing_plugin_path(self) -> None:
+        parser = _base_parser()
+        args = parser.parse_args(
+            [
+                "inspect-plugin",
+                "--plugin",
+                "/tmp/does-not-exist.vst3",
+            ]
+        )
+        with self.assertRaises(SystemExit):
+            _validate_args(parser, args)
+
+    def test_cli_validation_rejects_bad_training_steps_before_manifest_lookup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            plugin_path = Path(tmp) / "test.vst3"
+            plugin_path.mkdir()
+            parser = _base_parser()
+            args = parser.parse_args(
+                [
+                    "train-dqn",
+                    "--plugin",
+                    str(plugin_path),
+                    "--run-folder",
+                    "missing_manifest_test",
+                    "--steps",
+                    "0",
+                ]
+            )
+            with self.assertRaises(SystemExit):
+                _validate_args(parser, args)
 
 
 if __name__ == "__main__":

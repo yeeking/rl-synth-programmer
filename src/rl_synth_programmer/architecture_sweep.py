@@ -50,6 +50,8 @@ def _validate_architecture_spec(spec: dict[str, Any]) -> None:
     elif network_type == "hybrid_cnn_mlp":
         for key in ("channels", "kernel_sizes", "param_hidden_sizes", "fusion_hidden_sizes"):
             assert key in spec, f"hybrid_cnn_mlp architecture requires {key}."
+    elif network_type in {"rnn", "gru", "lstm"}:
+        assert "hidden_size" in spec, f"{network_type} architecture requires hidden_size."
     else:
         raise ValueError(f"Unsupported architecture type: {network_type}")
 
@@ -61,8 +63,33 @@ def _load_metadata(dataset_path: Path) -> dict[str, Any]:
     return {}
 
 
-def _split_indices(row_count: int, split: dict[str, float], seed: int) -> dict[str, np.ndarray]:
+def _split_indices(
+    row_count: int,
+    split: dict[str, float],
+    seed: int,
+    *,
+    group_ids: np.ndarray | None = None,
+) -> dict[str, np.ndarray]:
     rng = np.random.default_rng(seed)
+    if group_ids is not None:
+        groups = rng.permutation(np.unique(group_ids))
+        train_end = int(round(groups.shape[0] * split["train"]))
+        val_end = train_end + int(round(groups.shape[0] * split["val"]))
+        train_end = min(max(train_end, 1), groups.shape[0])
+        val_end = min(max(val_end, train_end), groups.shape[0])
+        split_groups = {
+            "train": groups[:train_end],
+            "val": groups[train_end:val_end],
+            "test": groups[val_end:],
+        }
+        if split_groups["val"].size == 0:
+            split_groups["val"] = split_groups["train"]
+        if split_groups["test"].size == 0:
+            split_groups["test"] = split_groups["val"]
+        return {
+            name: np.flatnonzero(np.isin(group_ids, values))
+            for name, values in split_groups.items()
+        }
     indices = rng.permutation(row_count)
     train_end = int(round(row_count * split["train"]))
     val_end = train_end + int(round(row_count * split["val"]))
@@ -80,12 +107,92 @@ def _split_indices(row_count: int, split: dict[str, float], seed: int) -> dict[s
     return result
 
 
+def _action_features(action_count: int, param_count: int, action_step: float) -> np.ndarray:
+    rows = []
+    denominator = max(1, int(param_count) - 1)
+    for action in range(int(action_count)):
+        parameter_index = action // 2
+        direction = 1.0 if action % 2 == 0 else -1.0
+        rows.append([float(parameter_index / denominator), float(direction * action_step)])
+    return np.asarray(rows, dtype=np.float32)
+
+
+def _prepare_supervised_arrays(
+    dataset,
+    metadata: dict[str, Any],
+    config: dict[str, Any],
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any], np.ndarray | None, np.ndarray | None]:
+    observations = np.asarray(dataset["observations"], dtype=np.float32)
+    rewards = np.asarray(dataset["action_rewards"], dtype=np.float32)
+    assert observations.ndim == 2, f"Expected 2D observations, got shape {observations.shape}."
+    assert rewards.ndim == 2, f"Expected 2D action_rewards, got shape {rewards.shape}."
+    target = str(config.get("target", "all_action_rewards"))
+    if target == "all_action_rewards":
+        return observations, rewards, metadata, None, None
+    if target != "action_reward_as_feature_change_proxy":
+        raise ValueError(f"Unsupported sweep target: {target}")
+
+    param_count = int(metadata["param_count"])
+    action_count = int(rewards.shape[1])
+    action_step = float(metadata.get("action_step", metadata.get("args", {}).get("action_step", 0.05)))
+    row_mask = np.ones((observations.shape[0],), dtype=bool)
+    if bool(config.get("exclude_failed_rows", True)):
+        if "failed_action_counts" in dataset.files:
+            row_mask &= np.asarray(dataset["failed_action_counts"], dtype=np.int32) == 0
+        if "state_skipped" in dataset.files:
+            row_mask &= np.asarray(dataset["state_skipped"], dtype=np.int32) == 0
+    observations = observations[row_mask]
+    rewards = rewards[row_mask]
+    assert observations.shape[0] > 0, "No rows remain after action-conditioned dataset filtering."
+
+    features = _action_features(action_count, param_count, action_step)
+    expanded_observations = np.repeat(observations, action_count, axis=0)
+    expanded_features = np.tile(features, (observations.shape[0], 1))
+    expanded_rewards = rewards.reshape(-1, 1).astype(np.float32)
+    group_ids = np.repeat(np.arange(observations.shape[0], dtype=np.int32), action_count)
+    action_ids = np.tile(np.arange(action_count, dtype=np.int32), observations.shape[0])
+    max_expanded_rows = int(config.get("max_expanded_rows", 0) or 0)
+    if max_expanded_rows > 0 and expanded_rewards.shape[0] > max_expanded_rows:
+        rng = np.random.default_rng(int(config.get("seed", 7)))
+        groups = np.unique(group_ids)
+        group_budget = max(1, max_expanded_rows // action_count)
+        selected_groups = rng.choice(groups, size=min(group_budget, groups.shape[0]), replace=False)
+        keep = np.isin(group_ids, selected_groups)
+        expanded_observations = expanded_observations[keep]
+        expanded_features = expanded_features[keep]
+        expanded_rewards = expanded_rewards[keep]
+        group_ids = group_ids[keep]
+        action_ids = action_ids[keep]
+    action_conditioned_observations = np.concatenate([expanded_observations, expanded_features], axis=1).astype(np.float32)
+    prepared_metadata = dict(metadata)
+    prepared_metadata["param_count"] = int(param_count + features.shape[1])
+    prepared_metadata["action_conditioned"] = True
+    prepared_metadata["action_feature_layout"] = {
+        "parameter_index_normalized": observations.shape[1],
+        "signed_delta": observations.shape[1] + 1,
+    }
+    prepared_metadata["source_row_count"] = int(row_mask.shape[0])
+    prepared_metadata["used_source_row_count"] = int(observations.shape[0])
+    prepared_metadata["expanded_row_count"] = int(action_conditioned_observations.shape[0])
+    return action_conditioned_observations, expanded_rewards, prepared_metadata, group_ids, action_ids
+
+
 def _batch_ranges(count: int, batch_size: int):
     for start in range(0, count, batch_size):
         yield start, min(start + batch_size, count)
 
 
-def _evaluate(torch, network, observations, rewards, indices: np.ndarray, batch_size: int) -> dict[str, float]:
+def _evaluate(
+    torch,
+    network,
+    observations,
+    rewards,
+    indices: np.ndarray,
+    batch_size: int,
+    *,
+    group_ids: np.ndarray | None = None,
+    action_ids: np.ndarray | None = None,
+) -> dict[str, float]:
     network.eval()
     predictions = []
     targets = []
@@ -99,20 +206,58 @@ def _evaluate(torch, network, observations, rewards, indices: np.ndarray, batch_
     pred = np.concatenate(predictions, axis=0)
     true = np.concatenate(targets, axis=0)
     errors = pred - true
-    true_best = np.argmax(true, axis=1)
-    pred_best = np.argmax(pred, axis=1)
-    top_k = min(5, true.shape[1])
-    pred_top_k = np.argsort(pred, axis=1)[:, -top_k:]
-    chosen_true_reward = true[np.arange(true.shape[0]), pred_best]
-    best_true_reward = true[np.arange(true.shape[0]), true_best]
-    return {
+    result = {
         "mse": float(np.mean(np.square(errors))),
         "mae": float(np.mean(np.abs(errors))),
-        "top1_accuracy": float(np.mean(pred_best == true_best)),
-        "top5_accuracy": float(np.mean([true_best[index] in pred_top_k[index] for index in range(true.shape[0])])),
-        "mean_regret": float(np.mean(best_true_reward - chosen_true_reward)),
         "sign_accuracy": float(np.mean(np.sign(pred) == np.sign(true))),
     }
+    if true.shape[1] > 1:
+        true_best = np.argmax(true, axis=1)
+        pred_best = np.argmax(pred, axis=1)
+        top_k = min(5, true.shape[1])
+        pred_top_k = np.argsort(pred, axis=1)[:, -top_k:]
+        chosen_true_reward = true[np.arange(true.shape[0]), pred_best]
+        best_true_reward = true[np.arange(true.shape[0]), true_best]
+        result.update(
+            {
+                "top1_accuracy": float(np.mean(pred_best == true_best)),
+                "top5_accuracy": float(np.mean([true_best[index] in pred_top_k[index] for index in range(true.shape[0])])),
+                "mean_regret": float(np.mean(best_true_reward - chosen_true_reward)),
+            }
+        )
+        return result
+    if group_ids is not None and action_ids is not None:
+        selected_groups = group_ids[indices]
+        selected_actions = action_ids[indices]
+        pred_values = pred.reshape(-1)
+        true_values = true.reshape(-1)
+        top1_hits = []
+        top5_hits = []
+        regrets = []
+        for group in np.unique(selected_groups):
+            mask = selected_groups == group
+            group_true = true_values[mask]
+            group_pred = pred_values[mask]
+            group_actions = selected_actions[mask]
+            true_best_index = int(np.argmax(group_true))
+            pred_best_index = int(np.argmax(group_pred))
+            true_best_action = int(group_actions[true_best_index])
+            pred_best_action = int(group_actions[pred_best_index])
+            top_k = min(5, group_pred.shape[0])
+            pred_top_actions = set(int(group_actions[index]) for index in np.argsort(group_pred)[-top_k:])
+            top1_hits.append(pred_best_action == true_best_action)
+            top5_hits.append(true_best_action in pred_top_actions)
+            regrets.append(float(group_true[true_best_index] - group_true[pred_best_index]))
+        result.update(
+            {
+                "top1_accuracy": float(np.mean(top1_hits)) if top1_hits else 0.0,
+                "top5_accuracy": float(np.mean(top5_hits)) if top5_hits else 0.0,
+                "mean_regret": float(np.mean(regrets)) if regrets else 0.0,
+            }
+        )
+    else:
+        result.update({"top1_accuracy": 0.0, "top5_accuracy": 0.0, "mean_regret": 0.0})
+    return result
 
 
 def _train_one(
@@ -122,6 +267,8 @@ def _train_one(
     rewards_np: np.ndarray,
     split_indices: dict[str, np.ndarray],
     metadata: dict[str, Any],
+    group_ids: np.ndarray | None,
+    action_ids: np.ndarray | None,
     out_dir: Path,
     progress: bool,
     tensorboard: bool,
@@ -168,7 +315,16 @@ def _train_one(
             optimizer.step()
             batch_losses.append(float(loss.item()))
         train_loss = float(np.mean(batch_losses)) if batch_losses else float("nan")
-        val_metrics = _evaluate(torch, network, observations, rewards, split_indices["val"], batch_size)
+        val_metrics = _evaluate(
+            torch,
+            network,
+            observations,
+            rewards,
+            split_indices["val"],
+            batch_size,
+            group_ids=group_ids,
+            action_ids=action_ids,
+        )
         row = {"epoch": epoch, "train_loss": train_loss, **{f"val_{k}": v for k, v in val_metrics.items()}}
         losses.append(row)
         writer.add_scalar("loss/train", train_loss, epoch)
@@ -181,9 +337,36 @@ def _train_one(
         "name": str(spec["name"]),
         "type": str(spec["type"]),
         "training_seconds": float(perf_counter() - started),
-        "train": _evaluate(torch, network, observations, rewards, split_indices["train"], batch_size),
-        "val": _evaluate(torch, network, observations, rewards, split_indices["val"], batch_size),
-        "test": _evaluate(torch, network, observations, rewards, split_indices["test"], batch_size),
+        "train": _evaluate(
+            torch,
+            network,
+            observations,
+            rewards,
+            split_indices["train"],
+            batch_size,
+            group_ids=group_ids,
+            action_ids=action_ids,
+        ),
+        "val": _evaluate(
+            torch,
+            network,
+            observations,
+            rewards,
+            split_indices["val"],
+            batch_size,
+            group_ids=group_ids,
+            action_ids=action_ids,
+        ),
+        "test": _evaluate(
+            torch,
+            network,
+            observations,
+            rewards,
+            split_indices["test"],
+            batch_size,
+            group_ids=group_ids,
+            action_ids=action_ids,
+        ),
         "checkpoint": str(arch_dir / "checkpoint.pt"),
     }
     torch.save({"state_dict": network.state_dict(), "spec": spec, "metadata": metadata}, arch_dir / "checkpoint.pt")
@@ -209,15 +392,17 @@ def compare_architectures(
     assert config_path.exists(), f"Sweep config file does not exist: {config_path}"
     stage_log(f"Loading action dataset from {dataset_path}.")
     dataset = np.load(dataset_path)
-    observations = np.asarray(dataset["observations"], dtype=np.float32)
-    rewards = np.asarray(dataset["action_rewards"], dtype=np.float32)
-    assert observations.ndim == 2, f"Expected 2D observations, got shape {observations.shape}."
-    assert rewards.ndim == 2, f"Expected 2D action_rewards, got shape {rewards.shape}."
     metadata = _load_metadata(dataset_path)
     config = load_sweep_config(config_path)
+    observations, rewards, metadata, group_ids, action_ids = _prepare_supervised_arrays(dataset, metadata, config)
     out_dir.mkdir(parents=True, exist_ok=True)
     write_json(out_dir / "sweep_config.json", config)
-    split_indices = _split_indices(observations.shape[0], config["split"], int(config.get("seed", 7)))
+    split_indices = _split_indices(
+        observations.shape[0],
+        config["split"],
+        int(config.get("seed", 7)),
+        group_ids=group_ids,
+    )
     stage_log(
         f"Comparing {len(config['architectures'])} architecture(s). "
         f"Rows={observations.shape[0]} obs={observations.shape[1]} actions={rewards.shape[1]}."
@@ -232,6 +417,8 @@ def compare_architectures(
             rewards_np=rewards,
             split_indices=split_indices,
             metadata=metadata,
+            group_ids=group_ids,
+            action_ids=action_ids,
             out_dir=out_dir,
             progress=progress,
             tensorboard=tensorboard,

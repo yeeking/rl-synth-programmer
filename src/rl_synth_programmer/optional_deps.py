@@ -13,5 +13,5 @@ def require_dependency(module_name: str, package_name: str | None = None):
         package = package_name or module_name
         raise RuntimeError(
             f"Optional dependency '{package}' is required for this operation. "
-            f"Install it with `pip install -e .[{package}]` or `pip install {package}`."
+            f"Install the project extra with `pip install -e .[{package}]`."
         ) from exc

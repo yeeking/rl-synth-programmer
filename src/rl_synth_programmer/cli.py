@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sys
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -12,6 +13,11 @@ import numpy as np
 from .architecture_sweep import compare_architectures
 from .config import CurriculumConfig, DQNConfig, ExperimentConfig, RewardConfig, SynthEnvConfig, SynthHostConfig
 from .env import make_env
+from .hyperparameter_search import (
+    default_feature_change_search_config,
+    discover_action_datasets,
+    run_feature_change_search,
+)
 from .host import SynthHost
 from .offline_dataset import ActionDatasetConfig, estimate_action_dataset, generate_action_dataset
 from .smoke import full_smoke_run, generate_target_set, inspect_plugin, smoke_evaluate, smoke_random_env, smoke_train_clap
@@ -360,6 +366,50 @@ def _base_parser() -> argparse.ArgumentParser:
         help="Write TensorBoard logs for supervised architecture training. Default: disabled.",
     )
 
+    search_parser = subparsers.add_parser(
+        "search-feature-change-models",
+        help="Run a CNN/RNN-focused architecture search across action datasets.",
+    )
+    search_parser.add_argument(
+        "--dataset",
+        action="append",
+        default=None,
+        help="Path to an action_dataset/dataset.npz file. Repeat to search multiple datasets. If omitted, datasets are discovered under --artifacts-root.",
+    )
+    search_parser.add_argument(
+        "--artifacts-root",
+        default=str(ARTIFACTS_ROOT),
+        help="Root used to discover */action_dataset/dataset.npz when --dataset is omitted. Default: artifacts.",
+    )
+    search_parser.add_argument(
+        "--config",
+        default=None,
+        help="Optional JSON sweep config. If omitted, a short CNN/RNN-heavy default config is generated.",
+    )
+    search_parser.add_argument(
+        "--out-dir",
+        default="architecture_search/feature_change",
+        help="Output directory for combined search artifacts. Relative paths are resolved under artifacts/. Default: architecture_search/feature_change.",
+    )
+    search_parser.add_argument(
+        "--epochs",
+        type=int,
+        default=5,
+        help="Epochs for the generated default config. Ignored when --config is provided. Default: 5.",
+    )
+    search_parser.add_argument(
+        "--progress",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable progress bars and stage logs. Default: enabled.",
+    )
+    search_parser.add_argument(
+        "--tensorboard",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Write TensorBoard logs for supervised training. Default: disabled.",
+    )
+
     smoke_random_parser = subparsers.add_parser("smoke-random-env", help="Run the random-agent smoke baseline.")
     smoke_random_parser.add_argument(
         "--plugin",
@@ -478,7 +528,7 @@ def _base_parser() -> argparse.ArgumentParser:
         help="Optional TensorBoard subdirectory under artifacts/. If omitted, defaults to <run-folder>/smoke_train_clap/tensorboard.",
     )
 
-    full_smoke_parser = subparsers.add_parser("full-smoke", help="Run the full corrected KR-106-style smoke workflow.")
+    full_smoke_parser = subparsers.add_parser("full-smoke", help="Run the full end-to-end real-plugin smoke workflow.")
     full_smoke_parser.add_argument(
         "--plugin",
         required=True,
@@ -612,6 +662,186 @@ def _find_train_checkpoint(run_folder: Path) -> Path:
         f"Did you run train-dqn with --run-folder {run_folder}?"
     )
     return checkpoint_path
+
+
+def _is_positive_int(value: object) -> bool:
+    return isinstance(value, int) and value >= 1
+
+
+def _is_nonnegative_int(value: object) -> bool:
+    return isinstance(value, int) and value >= 0
+
+
+def _is_positive_float(value: object) -> bool:
+    return isinstance(value, (int, float)) and float(value) > 0.0
+
+
+def _is_nonnegative_float(value: object) -> bool:
+    return isinstance(value, (int, float)) and float(value) >= 0.0
+
+
+def _argument_error(parser: argparse.ArgumentParser, message: str) -> None:
+    parser.error(message)
+
+
+def _require_plugin_path(parser: argparse.ArgumentParser, plugin_path: str) -> str:
+    if not plugin_path:
+        _argument_error(parser, "--plugin is required and cannot be empty.")
+    path = Path(plugin_path).expanduser()
+    if not path.exists():
+        _argument_error(parser, f"--plugin must point to an existing VST3 instrument. Not found: {path}")
+    if path.suffix.lower() != ".vst3":
+        _argument_error(parser, f"--plugin should point to a .vst3 bundle or file. Got: {path}")
+    return str(path)
+
+
+def _require_existing_run_manifest(parser: argparse.ArgumentParser, run_folder: str, command: str) -> None:
+    try:
+        run_root = _resolve_run_folder(run_folder, create=False)
+        _find_manifest(run_root)
+    except AssertionError as exc:
+        _argument_error(parser, f"{command} requires a generated target set. {exc}")
+
+
+def _require_existing_checkpoint(parser: argparse.ArgumentParser, run_folder: str, command: str, *, smoke: bool = False) -> None:
+    try:
+        run_root = _resolve_run_folder(run_folder, create=False)
+        if smoke:
+            _find_smoke_checkpoint(run_root)
+        else:
+            _find_train_checkpoint(run_root)
+    except AssertionError as exc:
+        _argument_error(parser, f"{command} requires an existing checkpoint. {exc}")
+
+
+def _require_existing_file(parser: argparse.ArgumentParser, option: str, value: str) -> None:
+    path = Path(value).expanduser()
+    if not path.exists():
+        _argument_error(parser, f"{option} must point to an existing file. Not found: {path}")
+    if not path.is_file():
+        _argument_error(parser, f"{option} must point to a file. Got: {path}")
+
+
+def _validate_common_logging(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    if hasattr(args, "log_interval") and not _is_positive_int(args.log_interval):
+        _argument_error(parser, "--log-interval must be an integer >= 1.")
+    if hasattr(args, "episode_log_interval") and not _is_positive_int(args.episode_log_interval):
+        _argument_error(parser, "--episode-log-interval must be an integer >= 1.")
+
+
+def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    _validate_common_logging(parser, args)
+    plugin_commands = {
+        "inspect-plugin",
+        "render",
+        "random-agent",
+        "train-dqn",
+        "evaluate",
+        "generate-target-set",
+        "generate-action-dataset",
+        "smoke-random-env",
+        "smoke-train-clap",
+        "smoke-evaluate",
+        "full-smoke",
+    }
+    if args.command in plugin_commands:
+        args.plugin = _require_plugin_path(parser, args.plugin)
+
+    if args.command == "render":
+        if not (0 <= int(args.note) <= 127):
+            _argument_error(parser, "--note must be a MIDI note number in the range 0-127.")
+        if not _is_positive_float(args.duration):
+            _argument_error(parser, "--duration must be > 0 seconds.")
+    elif args.command == "random-agent":
+        if not _is_positive_int(args.episodes):
+            _argument_error(parser, "--episodes must be an integer >= 1.")
+        if args.run_folder is not None:
+            _require_existing_run_manifest(parser, args.run_folder, "random-agent")
+    elif args.command == "train-dqn":
+        if not _is_positive_int(args.steps):
+            _argument_error(parser, "--steps must be an integer >= 1.")
+        if not _is_positive_int(args.num_workers):
+            _argument_error(parser, "--num-workers must be an integer >= 1.")
+        if not _is_positive_int(args.updates_per_tick):
+            _argument_error(parser, "--updates-per-tick must be an integer >= 1.")
+        if args.clap_batch_size is not None and not _is_positive_int(args.clap_batch_size):
+            _argument_error(parser, "--clap-batch-size must be an integer >= 1.")
+        if args.epsilon_decay_steps is not None and not _is_positive_int(args.epsilon_decay_steps):
+            _argument_error(parser, "--epsilon-decay-steps must be an integer >= 1.")
+        if args.max_episode_steps is not None and not _is_positive_int(args.max_episode_steps):
+            _argument_error(parser, "--max-episode-steps must be an integer >= 1.")
+        _require_existing_run_manifest(parser, args.run_folder, "train-dqn")
+    elif args.command == "evaluate":
+        if not _is_positive_int(args.episodes):
+            _argument_error(parser, "--episodes must be an integer >= 1.")
+        _require_existing_run_manifest(parser, args.run_folder, "evaluate")
+        _require_existing_checkpoint(parser, args.run_folder, "evaluate")
+    elif args.command == "generate-target-set":
+        if not _is_positive_int(args.subset_limit):
+            _argument_error(parser, "--subset-limit must be an integer >= 1.")
+    elif args.command == "generate-action-dataset":
+        if not _is_positive_int(args.max_states):
+            _argument_error(parser, "--max-states must be an integer >= 1.")
+        if not _is_positive_int(args.moves_per_start):
+            _argument_error(parser, "--moves-per-start must be an integer >= 1.")
+        if not _is_positive_int(args.num_workers):
+            _argument_error(parser, "--num-workers must be an integer >= 1.")
+        if not _is_positive_int(args.clap_batch_size):
+            _argument_error(parser, "--clap-batch-size must be an integer >= 1.")
+        if not _is_positive_float(args.render_timeout_seconds):
+            _argument_error(parser, "--render-timeout-seconds must be > 0.")
+        if not _is_positive_int(args.shard_size):
+            _argument_error(parser, "--shard-size must be an integer >= 1.")
+        if not _is_nonnegative_int(args.render_chunk_size):
+            _argument_error(parser, "--render-chunk-size must be an integer >= 0.")
+        if args.max_state_seconds is not None and not _is_positive_float(args.max_state_seconds):
+            _argument_error(parser, "--max-state-seconds must be > 0 when provided.")
+        if not _is_nonnegative_int(args.reload_workers_every_renders):
+            _argument_error(parser, "--reload-workers-every-renders must be an integer >= 0.")
+        if not _is_nonnegative_float(args.preset_render_slowdown_threshold):
+            _argument_error(parser, "--preset-render-slowdown-threshold must be >= 0.")
+        _require_existing_run_manifest(parser, args.run_folder, "generate-action-dataset")
+    elif args.command == "compare-architectures":
+        _require_existing_file(parser, "--dataset", args.dataset)
+        _require_existing_file(parser, "--config", args.config)
+    elif args.command == "search-feature-change-models":
+        if not _is_positive_int(args.epochs):
+            _argument_error(parser, "--epochs must be an integer >= 1.")
+        if args.config is not None:
+            _require_existing_file(parser, "--config", args.config)
+        if args.dataset:
+            for dataset_path in args.dataset:
+                _require_existing_file(parser, "--dataset", dataset_path)
+        else:
+            discovered = discover_action_datasets(Path(args.artifacts_root))
+            if not discovered:
+                _argument_error(
+                    parser,
+                    f"No action datasets found under {args.artifacts_root}. "
+                    "Pass --dataset path/to/action_dataset/dataset.npz or generate one first.",
+                )
+    elif args.command == "smoke-random-env":
+        if not _is_positive_int(args.episodes):
+            _argument_error(parser, "--episodes must be an integer >= 1.")
+        _require_existing_run_manifest(parser, args.run_folder, "smoke-random-env")
+    elif args.command == "smoke-train-clap":
+        if not _is_positive_int(args.steps):
+            _argument_error(parser, "--steps must be an integer >= 1.")
+        _require_existing_run_manifest(parser, args.run_folder, "smoke-train-clap")
+    elif args.command == "smoke-evaluate":
+        if not _is_positive_int(args.episodes):
+            _argument_error(parser, "--episodes must be an integer >= 1.")
+        _require_existing_run_manifest(parser, args.run_folder, "smoke-evaluate")
+        _require_existing_checkpoint(parser, args.run_folder, "smoke-evaluate", smoke=True)
+    elif args.command == "full-smoke":
+        if not _is_positive_int(args.subset_limit):
+            _argument_error(parser, "--subset-limit must be an integer >= 1.")
+        if not _is_positive_int(args.random_episodes):
+            _argument_error(parser, "--random-episodes must be an integer >= 1.")
+        if not _is_positive_int(args.train_steps):
+            _argument_error(parser, "--train-steps must be an integer >= 1.")
+        if not _is_positive_int(args.eval_episodes):
+            _argument_error(parser, "--eval-episodes must be an integer >= 1.")
 
 
 def _experiment_config(
@@ -837,157 +1067,199 @@ def _cmd_compare_architectures(
     print(json.dumps(result, indent=2))
 
 
+def _cmd_search_feature_change_models(
+    dataset_paths: list[str] | None,
+    artifacts_root: str,
+    config_path: str | None,
+    out_dir: str,
+    epochs: int,
+    progress: bool,
+    tensorboard: bool,
+) -> None:
+    if dataset_paths:
+        datasets = [Path(path) for path in dataset_paths]
+    else:
+        datasets = discover_action_datasets(Path(artifacts_root))
+    if config_path is not None:
+        config = json.loads(Path(config_path).read_text())
+    else:
+        config = default_feature_change_search_config(epochs=epochs)
+    result = run_feature_change_search(
+        datasets,
+        _resolve_run_folder(out_dir, create=True),
+        config=config,
+        progress=progress,
+        tensorboard=tensorboard,
+    )
+    print(json.dumps(result, indent=2))
+
+
 def main() -> None:
     parser = _base_parser()
     args = parser.parse_args()
-    if args.command == "inspect-plugin":
-        _cmd_inspect(args.plugin, args.run_folder)
-    elif args.command == "render":
-        _cmd_render(args.plugin, args.note, args.duration)
-    elif args.command == "random-agent":
-        _cmd_random_agent(args.plugin, args.episodes, args.run_folder, args.progress, args.episode_log_interval)
-    elif args.command == "train-dqn":
-        _cmd_train_dqn(
-            args.plugin,
-            args.run_folder,
-            args.steps,
-            args.reward_mode,
-            args.progress,
-            args.log_interval,
-            args.episode_log_interval,
-            args.tensorboard,
-            args.tensorboard_dir,
-            args.num_workers,
-            args.updates_per_tick,
-            args.clap_batch_size,
-            args.epsilon_decay_steps,
-            args.max_episode_steps,
-        )
-    elif args.command == "evaluate":
-        _cmd_evaluate(
-            args.plugin,
-            args.run_folder,
-            args.episodes,
-            args.progress,
-            args.episode_log_interval,
-            args.tensorboard,
-            args.tensorboard_dir,
-        )
-    elif args.command == "generate-target-set":
-        run_root = _resolve_run_folder(args.run_folder, create=True)
-        print(
-            json.dumps(
-                generate_target_set(
-                    Path(args.plugin),
-                    run_root,
-                    subset_limit=args.subset_limit,
-                    progress=args.progress,
-                ),
-                indent=2,
+    _validate_args(parser, args)
+    try:
+        if args.command == "inspect-plugin":
+            _cmd_inspect(args.plugin, args.run_folder)
+        elif args.command == "render":
+            _cmd_render(args.plugin, args.note, args.duration)
+        elif args.command == "random-agent":
+            _cmd_random_agent(args.plugin, args.episodes, args.run_folder, args.progress, args.episode_log_interval)
+        elif args.command == "train-dqn":
+            _cmd_train_dqn(
+                args.plugin,
+                args.run_folder,
+                args.steps,
+                args.reward_mode,
+                args.progress,
+                args.log_interval,
+                args.episode_log_interval,
+                args.tensorboard,
+                args.tensorboard_dir,
+                args.num_workers,
+                args.updates_per_tick,
+                args.clap_batch_size,
+                args.epsilon_decay_steps,
+                args.max_episode_steps,
             )
-        )
-    elif args.command == "generate-action-dataset":
-        _cmd_generate_action_dataset(
-            args.plugin,
-            args.run_folder,
-            args.reward_mode,
-            args.max_states,
-            args.moves_per_start,
-            args.num_workers,
-            args.clap_batch_size,
-            args.estimate_only,
-            args.yes,
-            args.progress,
-            args.render_timeout_seconds,
-            args.skip_failed_actions,
-            args.shard_size,
-            args.render_chunk_size,
-            args.max_state_seconds,
-            args.reload_workers_every_renders,
-            args.preset_render_slowdown_threshold,
-            args.reload_workers_on_render_slowdown,
-        )
-    elif args.command == "compare-architectures":
-        _cmd_compare_architectures(
-            args.dataset,
-            args.config,
-            args.out_dir,
-            args.progress,
-            args.tensorboard,
-        )
-    elif args.command == "smoke-random-env":
-        run_root = _resolve_run_folder(args.run_folder, create=False)
-        print(
-            json.dumps(
-                smoke_random_env(
-                    Path(args.plugin),
-                    run_root,
-                    _find_manifest(run_root),
-                    episodes=args.episodes,
-                    progress=args.progress,
-                    episode_log_interval=args.episode_log_interval,
-                ),
-                indent=2,
+        elif args.command == "evaluate":
+            _cmd_evaluate(
+                args.plugin,
+                args.run_folder,
+                args.episodes,
+                args.progress,
+                args.episode_log_interval,
+                args.tensorboard,
+                args.tensorboard_dir,
             )
-        )
-    elif args.command == "smoke-train-clap":
-        run_root = _resolve_run_folder(args.run_folder, create=True)
-        print(
-            json.dumps(
-                smoke_train_clap(
-                    Path(args.plugin),
-                    run_root,
-                    _find_manifest(run_root),
-                    steps=args.steps,
-                    progress=args.progress,
-                    log_interval=args.log_interval,
-                    episode_log_interval=args.episode_log_interval,
-                    tensorboard=args.tensorboard,
-                    tensorboard_dir=_resolve_tensorboard_dir(run_root, "smoke-train-clap", args.tensorboard_dir),
-                ),
-                indent=2,
+        elif args.command == "generate-target-set":
+            run_root = _resolve_run_folder(args.run_folder, create=True)
+            print(
+                json.dumps(
+                    generate_target_set(
+                        Path(args.plugin),
+                        run_root,
+                        subset_limit=args.subset_limit,
+                        progress=args.progress,
+                    ),
+                    indent=2,
+                )
             )
-        )
-    elif args.command == "smoke-evaluate":
-        run_root = _resolve_run_folder(args.run_folder, create=False)
-        print(
-            json.dumps(
-                smoke_evaluate(
-                    Path(args.plugin),
-                    run_root,
-                    _find_manifest(run_root),
-                    _find_smoke_checkpoint(run_root),
-                    episodes=args.episodes,
-                    progress=args.progress,
-                    episode_log_interval=args.episode_log_interval,
-                    tensorboard=args.tensorboard,
-                    tensorboard_dir=_resolve_tensorboard_dir(run_root, "smoke-evaluate", args.tensorboard_dir),
-                ),
-                indent=2,
+        elif args.command == "generate-action-dataset":
+            _cmd_generate_action_dataset(
+                args.plugin,
+                args.run_folder,
+                args.reward_mode,
+                args.max_states,
+                args.moves_per_start,
+                args.num_workers,
+                args.clap_batch_size,
+                args.estimate_only,
+                args.yes,
+                args.progress,
+                args.render_timeout_seconds,
+                args.skip_failed_actions,
+                args.shard_size,
+                args.render_chunk_size,
+                args.max_state_seconds,
+                args.reload_workers_every_renders,
+                args.preset_render_slowdown_threshold,
+                args.reload_workers_on_render_slowdown,
             )
-        )
-    elif args.command == "full-smoke":
-        run_root = _resolve_run_folder(args.run_folder, create=True)
-        print(
-            json.dumps(
-                full_smoke_run(
-                    Path(args.plugin),
-                    run_root,
-                    subset_limit=args.subset_limit,
-                    random_episodes=args.random_episodes,
-                    train_steps=args.train_steps,
-                    eval_episodes=args.eval_episodes,
-                    progress=args.progress,
-                    log_interval=args.log_interval,
-                    episode_log_interval=args.episode_log_interval,
-                    tensorboard=args.tensorboard,
-                    tensorboard_dir=_resolve_tensorboard_dir(run_root, "full-smoke", args.tensorboard_dir),
-                ),
-                indent=2,
+        elif args.command == "compare-architectures":
+            _cmd_compare_architectures(
+                args.dataset,
+                args.config,
+                args.out_dir,
+                args.progress,
+                args.tensorboard,
             )
-        )
-    else:
-        raise AssertionError(f"Unhandled command: {args.command}")
+        elif args.command == "search-feature-change-models":
+            _cmd_search_feature_change_models(
+                args.dataset,
+                args.artifacts_root,
+                args.config,
+                args.out_dir,
+                args.epochs,
+                args.progress,
+                args.tensorboard,
+            )
+        elif args.command == "smoke-random-env":
+            run_root = _resolve_run_folder(args.run_folder, create=False)
+            print(
+                json.dumps(
+                    smoke_random_env(
+                        Path(args.plugin),
+                        run_root,
+                        _find_manifest(run_root),
+                        episodes=args.episodes,
+                        progress=args.progress,
+                        episode_log_interval=args.episode_log_interval,
+                    ),
+                    indent=2,
+                )
+            )
+        elif args.command == "smoke-train-clap":
+            run_root = _resolve_run_folder(args.run_folder, create=True)
+            print(
+                json.dumps(
+                    smoke_train_clap(
+                        Path(args.plugin),
+                        run_root,
+                        _find_manifest(run_root),
+                        steps=args.steps,
+                        progress=args.progress,
+                        log_interval=args.log_interval,
+                        episode_log_interval=args.episode_log_interval,
+                        tensorboard=args.tensorboard,
+                        tensorboard_dir=_resolve_tensorboard_dir(run_root, "smoke-train-clap", args.tensorboard_dir),
+                    ),
+                    indent=2,
+                )
+            )
+        elif args.command == "smoke-evaluate":
+            run_root = _resolve_run_folder(args.run_folder, create=False)
+            print(
+                json.dumps(
+                    smoke_evaluate(
+                        Path(args.plugin),
+                        run_root,
+                        _find_manifest(run_root),
+                        _find_smoke_checkpoint(run_root),
+                        episodes=args.episodes,
+                        progress=args.progress,
+                        episode_log_interval=args.episode_log_interval,
+                        tensorboard=args.tensorboard,
+                        tensorboard_dir=_resolve_tensorboard_dir(run_root, "smoke-evaluate", args.tensorboard_dir),
+                    ),
+                    indent=2,
+                )
+            )
+        elif args.command == "full-smoke":
+            run_root = _resolve_run_folder(args.run_folder, create=True)
+            print(
+                json.dumps(
+                    full_smoke_run(
+                        Path(args.plugin),
+                        run_root,
+                        subset_limit=args.subset_limit,
+                        random_episodes=args.random_episodes,
+                        train_steps=args.train_steps,
+                        eval_episodes=args.eval_episodes,
+                        progress=args.progress,
+                        log_interval=args.log_interval,
+                        episode_log_interval=args.episode_log_interval,
+                        tensorboard=args.tensorboard,
+                        tensorboard_dir=_resolve_tensorboard_dir(run_root, "full-smoke", args.tensorboard_dir),
+                    ),
+                    indent=2,
+                )
+            )
+        else:
+            raise AssertionError(f"Unhandled command: {args.command}")
+    except (AssertionError, RuntimeError, ValueError) as exc:
+        print(f"rl-synth: error: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
 
 
 if __name__ == "__main__":

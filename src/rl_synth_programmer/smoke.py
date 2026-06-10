@@ -12,7 +12,7 @@ from .env import make_env
 from .host import SynthHost
 from .logging_utils import make_progress_bar, progress_iter, stage_log
 from .manifest import append_csv, target_record, write_json
-from .reward import CLAPEmbedder, SimilarityRewardModel
+from .reward import CLAPEmbedder, CLAP_WEIGHTS_DIR, SimilarityRewardModel
 from .training import evaluate_dqn, run_random_policy, train_dqn
 
 
@@ -25,8 +25,8 @@ def _artifact_dir(base_dir: Path, name: str) -> Path:
 def _offline_reward_config(mode: str) -> RewardConfig:
     config = RewardConfig(mode=mode)
     if mode == "clap":
-        config.clap_checkpoint = Path("models/msclap/CLAP_weights_2023.pth").resolve()
-        config.clap_text_model_path = Path("models/gpt2").resolve()
+        config.clap_checkpoint = (CLAP_WEIGHTS_DIR / "CLAP_weights_2023.pth").resolve()
+        config.clap_text_model_path = (CLAP_WEIGHTS_DIR / "gpt2").resolve()
         assert config.clap_checkpoint.exists(), f"Missing offline CLAP checkpoint: {config.clap_checkpoint}"
         assert config.clap_text_model_path.exists(), f"Missing offline text model path: {config.clap_text_model_path}"
     return config

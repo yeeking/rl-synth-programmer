@@ -106,6 +106,38 @@ def build_cnn1d(
     )
 
 
+def build_recurrent(
+    observation_size: int,
+    action_size: int,
+    *,
+    param_count: int,
+    embedding_size: int | None = None,
+    hidden_size: int,
+    layers: int = 1,
+    cell: str = "gru",
+    bidirectional: bool = False,
+    param_hidden_sizes: Iterable[int] = (),
+    head_hidden_sizes: Iterable[int] = (),
+    dropout: float | None = None,
+):
+    torch = require_dependency("torch", "ml")
+    embedding_size, param_count = _observation_layout(observation_size, param_count, embedding_size)
+    recurrent_class = _recurrent_action_value_network_class(torch)
+    return recurrent_class(
+        observation_size=int(observation_size),
+        action_size=int(action_size),
+        embedding_size=embedding_size,
+        param_count=param_count,
+        hidden_size=int(hidden_size),
+        layers=int(layers),
+        cell=str(cell),
+        bidirectional=bool(bidirectional),
+        param_hidden_sizes=[int(value) for value in param_hidden_sizes],
+        head_hidden_sizes=[int(value) for value in head_hidden_sizes],
+        dropout=dropout,
+    )
+
+
 def build_network(
     spec: dict[str, Any],
     *,
@@ -144,6 +176,21 @@ def build_network(
             embedding_hidden_size=int(spec.get("embedding_hidden_size", spec.get("fusion_embedding_size", 128))),
             param_hidden_sizes=spec["param_hidden_sizes"],
             head_hidden_sizes=spec[head_key],
+            dropout=spec.get("dropout"),
+        )
+    if network_type in {"rnn", "gru", "lstm"}:
+        assert param_count is not None, f"{network_type} requires param_count."
+        return build_recurrent(
+            observation_size,
+            action_size,
+            param_count=int(param_count),
+            embedding_size=embedding_size,
+            hidden_size=int(spec["hidden_size"]),
+            layers=int(spec.get("layers", 1)),
+            cell=str(spec.get("cell", network_type)),
+            bidirectional=bool(spec.get("bidirectional", False)),
+            param_hidden_sizes=spec.get("param_hidden_sizes", []),
+            head_hidden_sizes=spec.get("head_hidden_sizes", []),
             dropout=spec.get("dropout"),
         )
     raise ValueError(f"Unsupported architecture type: {network_type}")
@@ -224,3 +271,66 @@ def _cnn_action_value_network_class(torch):
             return self.output(self.head(features))
 
     return _CnnActionValueNetwork
+
+
+def _recurrent_action_value_network_class(torch):
+    class _RecurrentActionValueNetwork(torch.nn.Module):
+        def __init__(
+            self,
+            *,
+            observation_size: int,
+            action_size: int,
+            embedding_size: int,
+            param_count: int,
+            hidden_size: int,
+            layers: int,
+            cell: str,
+            bidirectional: bool,
+            param_hidden_sizes: list[int],
+            head_hidden_sizes: list[int],
+            dropout: float | None,
+        ):
+            super().__init__()
+            assert layers >= 1, f"Recurrent layers must be >= 1, got {layers}."
+            self.observation_size = observation_size
+            self.embedding_size = embedding_size
+            self.param_count = param_count
+            recurrent_dropout = float(dropout or 0.0) if int(layers) > 1 else 0.0
+            cell_name = str(cell).lower()
+            if cell_name == "rnn":
+                recurrent_type = torch.nn.RNN
+            elif cell_name == "gru":
+                recurrent_type = torch.nn.GRU
+            elif cell_name == "lstm":
+                recurrent_type = torch.nn.LSTM
+            else:
+                raise ValueError(f"Unsupported recurrent cell: {cell}")
+            self.recurrent = recurrent_type(
+                input_size=embedding_size,
+                hidden_size=hidden_size,
+                num_layers=layers,
+                batch_first=True,
+                dropout=recurrent_dropout,
+                bidirectional=bidirectional,
+            )
+            recurrent_out = hidden_size * (2 if bidirectional else 1)
+            self.param_branch, param_out = _build_dense_stack(torch, param_count, param_hidden_sizes, dropout=dropout)
+            if not param_hidden_sizes:
+                self.param_branch = torch.nn.Identity()
+                param_out = param_count
+            self.head, head_out = _build_dense_stack(torch, recurrent_out + param_out, head_hidden_sizes, dropout=dropout)
+            self.output = torch.nn.Linear(head_out, action_size)
+
+        def forward(self, observation):
+            target = observation[:, : self.embedding_size]
+            current = observation[:, self.embedding_size : 2 * self.embedding_size]
+            delta = observation[:, 2 * self.embedding_size : 3 * self.embedding_size]
+            params = observation[:, 3 * self.embedding_size :]
+            sequence = torch.stack([target, current, delta], dim=1)
+            recurrent_output, _hidden = self.recurrent(sequence)
+            embedding_features = recurrent_output[:, -1, :]
+            param_features = self.param_branch(params)
+            features = torch.cat([embedding_features, param_features], dim=1)
+            return self.output(self.head(features))
+
+    return _RecurrentActionValueNetwork

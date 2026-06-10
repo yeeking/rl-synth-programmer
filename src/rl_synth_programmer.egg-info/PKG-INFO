@@ -6,6 +6,7 @@ Requires-Python: >=3.11
 Description-Content-Type: text/markdown
 License-File: LICENSE
 Requires-Dist: numpy>=1.26
+Requires-Dist: PyYAML>=6.0
 Requires-Dist: tqdm>=4.66
 Provides-Extra: runtime
 Requires-Dist: pedalboard>=0.9.18; extra == "runtime"
@@ -24,73 +25,225 @@ Dynamic: license-file
 
 # RL Synth Programmer
 
-VST3 synth hosting, preset-derived target generation, Gym environment wrapping, and DQN training.
+Tools for programming VST3 instrument presets with offline reward datasets, supervised action-value training, and a DQN reinforcement-learning agent.
+
+The project is built around a preset-to-preset workflow:
+
+1. Capture a synth's built-in presets as target sounds.
+2. Generate an offline all-actions dataset from target/start preset pairs.
+3. Train and compare supervised action-value models on that dataset.
+4. Train or evaluate the online DQN agent against the same target manifest.
 
 ## Setup
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -e .[runtime,ml]
+pip install -e .[runtime,ml,dev]
 ```
 
-## Example Commands
-
-Full lightweight smoke run:
+You need a local VST3 instrument for real runs:
 
 ```bash
-rl-synth full-smoke \
-  --plugin "/home/matthew/.vst3/Ultramaster KR-106.vst3" \
-  --run-folder "artifacts/kr106_smoke_test" \
-  --subset-limit 12 \
-  --random-episodes 8 \
-  --train-steps 1000 \
-  --eval-episodes 8
+export SYNTH_PLUGIN="/path/to/Instrument.vst3"
+export RUN_FOLDER="artifacts/my_synth_run"
 ```
 
-Basic training workflow:
+CLAP weights and text-model files are cached under `clap-weights/`. The code checks that local cache first and downloads missing assets from Hugging Face when CLAP is used. For offline-only smoke runs, make sure the cache already contains `CLAP_weights_2023.pth` and the required text model directory, such as `clap-weights/gpt2/`.
+
+## Main Workflow
+
+Generate a target manifest from the synth's built-in presets:
 
 ```bash
 rl-synth generate-target-set \
-  --plugin "/home/matthew/.vst3/Ultramaster KR-106.vst3" \
-  --run-folder "artifacts/kr106_real" \
-  --subset-limit 12
+  --plugin "$SYNTH_PLUGIN" \
+  --run-folder "$RUN_FOLDER" \
+  --subset-limit 32
+```
 
+This writes:
+
+```text
+artifacts/my_synth_run/
+  targets/
+    manifest.json
+    manifest.csv
+    states/
+    audio/
+```
+
+Generate a reusable offline action dataset. Each row stores the current observation plus the immediate CLAP reward for every available parameter-tweak action:
+
+```bash
+rl-synth generate-action-dataset \
+  --plugin "$SYNTH_PLUGIN" \
+  --run-folder "$RUN_FOLDER" \
+  --max-states 1024 \
+  --moves-per-start 8 \
+  --num-workers 4 \
+  --clap-batch-size 8 \
+  --render-timeout-seconds 300 \
+  --max-state-seconds 90 \
+  --shard-size 16 \
+  --yes
+```
+
+Preview cost before writing `dataset.npz`:
+
+```bash
+rl-synth generate-action-dataset \
+  --plugin "$SYNTH_PLUGIN" \
+  --run-folder "$RUN_FOLDER" \
+  --estimate-only
+```
+
+Compare supervised action-value architectures:
+
+```bash
+rl-synth compare-architectures \
+  --dataset "$RUN_FOLDER/action_dataset/dataset.npz" \
+  --config "$RUN_FOLDER/sweep.json" \
+  --out-dir "$RUN_FOLDER/architecture_sweep"
+```
+
+Train the online DQN agent:
+
+```bash
 rl-synth train-dqn \
-  --plugin "/home/matthew/.vst3/Ultramaster KR-106.vst3" \
-  --run-folder "artifacts/kr106_real" \
+  --plugin "$SYNTH_PLUGIN" \
+  --run-folder "$RUN_FOLDER" \
   --reward-mode clap \
-  --steps 20000
+  --steps 20000 \
+  --epsilon-decay-steps 50000 \
+  --max-episode-steps 48
+```
 
+Evaluate the latest DQN checkpoint:
+
+```bash
 rl-synth evaluate \
-  --plugin "/home/matthew/.vst3/Ultramaster KR-106.vst3" \
-  --run-folder "artifacts/kr106_real" \
+  --plugin "$SYNTH_PLUGIN" \
+  --run-folder "$RUN_FOLDER" \
   --episodes 16
 ```
 
-## Main Commands
+## Command Reference
 
 ```bash
-rl-synth inspect-plugin --plugin /path/to/synth.vst3 --run-folder "artifacts/inspect"
-rl-synth generate-target-set --plugin /path/to/synth.vst3 --run-folder "artifacts/my_run" --subset-limit 12
-rl-synth random-agent --plugin /path/to/synth.vst3 --run-folder "artifacts/my_run"
-rl-synth train-dqn --plugin /path/to/synth.vst3 --run-folder "artifacts/my_run" --reward-mode clap --steps 2000
-rl-synth evaluate --plugin /path/to/synth.vst3 --run-folder "artifacts/my_run" --episodes 8
-rl-synth smoke-random-env --plugin /path/to/synth.vst3 --run-folder "artifacts/my_run"
-rl-synth smoke-train-clap --plugin /path/to/synth.vst3 --run-folder "artifacts/my_run" --steps 128
-rl-synth smoke-evaluate --plugin /path/to/synth.vst3 --run-folder "artifacts/my_run" --episodes 4
-rl-synth full-smoke --plugin /path/to/synth.vst3 --run-folder "artifacts/full_smoke"
+rl-synth inspect-plugin --plugin "$SYNTH_PLUGIN" --run-folder artifacts/inspect
+rl-synth render --plugin "$SYNTH_PLUGIN" --note 60 --duration 1.0
+rl-synth generate-target-set --plugin "$SYNTH_PLUGIN" --run-folder "$RUN_FOLDER" --subset-limit 12
+rl-synth generate-action-dataset --plugin "$SYNTH_PLUGIN" --run-folder "$RUN_FOLDER" --max-states 256
+rl-synth compare-architectures --dataset "$RUN_FOLDER/action_dataset/dataset.npz" --config "$RUN_FOLDER/sweep.json" --out-dir "$RUN_FOLDER/architecture_sweep"
+rl-synth random-agent --plugin "$SYNTH_PLUGIN" --run-folder "$RUN_FOLDER" --episodes 4
+rl-synth train-dqn --plugin "$SYNTH_PLUGIN" --run-folder "$RUN_FOLDER" --reward-mode clap --steps 2000
+rl-synth evaluate --plugin "$SYNTH_PLUGIN" --run-folder "$RUN_FOLDER" --episodes 8
+rl-synth full-smoke --plugin "$SYNTH_PLUGIN" --run-folder artifacts/full_smoke
 ```
 
-`--run-folder` is the user-facing artifact root. The CLI creates it if needed for write commands and auto-discovers internal files like manifests and checkpoints beneath it.
+`--run-folder` is the artifact root. Passing `my_run` or `artifacts/my_run` both resolve to `artifacts/my_run`; absolute paths are converted to a folder under `artifacts/` using the final path name.
 
-Internal layout under a run folder is:
+## Offline Dataset Details
 
-- `targets/` for generated preset targets and `manifest.json`
-- `train_dqn/` for the main training checkpoint and TensorBoard logs
-- `smoke_*` folders for smoke-run outputs
+`generate-action-dataset` samples target/start preset pairs round-robin. It renders move 0 for each pair first, then move 1 for each pair, up to `--moves-per-start` or `--max-states`. For every sampled state, it evaluates every discrete action and stores:
 
-Console progress bars and stage logs are enabled by default for target generation, training, and evaluation. Use `--no-progress` to reduce live terminal output.
+- `observations`: flattened `[target_embedding, current_embedding, delta_embedding, params]`
+- `action_rewards`: immediate reward for each action
+- `current_distances`, target/start indices, move indices, best actions, and render diagnostics
+
+Long runs write recoverable shards under `<run-folder>/action_dataset/shards/` before merging the final `<run-folder>/action_dataset/dataset.npz`. Metadata and summary files are written next to the dataset.
+
+Useful reliability options:
+
+- `--render-timeout-seconds`: timeout for one render chunk
+- `--skip-failed-actions` / `--no-skip-failed-actions`: continue with a large negative reward for timed-out actions or abort
+- `--max-state-seconds`: skip pathological slow states
+- `--reload-workers-every-renders`: periodically reload plugin worker processes
+- `--preset-render-slowdown-threshold`: detect sudden per-action render slowdowns
+- `--reload-workers-on-render-slowdown` / `--no-reload-workers-on-render-slowdown`: reload workers or assert on slowdown
+
+## Architecture Sweep
+
+Example `sweep.json`:
+
+```json
+{
+  "split": {"train": 0.8, "val": 0.1, "test": 0.1},
+  "architectures": [
+    {
+      "name": "mlp-512-256",
+      "type": "mlp",
+      "hidden_sizes": [512, 256],
+      "learning_rate": 0.001,
+      "batch_size": 64,
+      "epochs": 20,
+      "seed": 7
+    },
+    {
+      "name": "cnn-small",
+      "type": "cnn1d",
+      "channels": [32, 64],
+      "kernel_sizes": [5, 3],
+      "embedding_hidden_size": 128,
+      "param_hidden_sizes": [64],
+      "head_hidden_sizes": [128],
+      "learning_rate": 0.001,
+      "batch_size": 64,
+      "epochs": 20,
+      "seed": 8
+    }
+  ]
+}
+```
+
+Supported architecture types are `mlp`, `residual_mlp`, `cnn1d`, and `hybrid_cnn_mlp`. The sweep writes per-architecture checkpoints and metrics plus `leaderboard.json` and `leaderboard.csv`.
+
+## DQN Agent Path
+
+`train-dqn` can run either a classic single environment or batched parallel rollout:
+
+```bash
+rl-synth train-dqn \
+  --plugin "$SYNTH_PLUGIN" \
+  --run-folder "$RUN_FOLDER" \
+  --reward-mode clap \
+  --steps 2000 \
+  --num-workers 4 \
+  --updates-per-tick 1 \
+  --clap-batch-size 8
+```
+
+The batched path activates automatically when `--num-workers > 1`. It uses multiple synth-render worker processes and one shared CLAP embedder in the parent process.
+
+Current training behavior:
+
+- Manifest-backed episodes start from another preset in the target set when possible.
+- Rewards are improvement based: `previous_distance - new_distance`.
+- `--epsilon-decay-steps` controls step-based epsilon decay.
+- `--max-episode-steps` controls episode truncation.
+
+## Smoke Checks
+
+The full real-plugin smoke workflow exercises plugin inspection, target generation, CLAP embedding, random rollout, DQN training, and evaluation:
+
+```bash
+rl-synth full-smoke \
+  --plugin "$SYNTH_PLUGIN" \
+  --run-folder artifacts/full_smoke \
+  --subset-limit 12 \
+  --random-episodes 6 \
+  --train-steps 128 \
+  --eval-episodes 4
+```
+
+Smaller smoke phases are also available:
+
+```bash
+rl-synth smoke-random-env --plugin "$SYNTH_PLUGIN" --run-folder "$RUN_FOLDER" --episodes 4
+rl-synth smoke-train-clap --plugin "$SYNTH_PLUGIN" --run-folder "$RUN_FOLDER" --steps 128
+rl-synth smoke-evaluate --plugin "$SYNTH_PLUGIN" --run-folder "$RUN_FOLDER" --episodes 4
+```
 
 ## TensorBoard
 
@@ -103,5 +256,17 @@ Training and evaluation can write TensorBoard logs. By default:
 Example:
 
 ```bash
-tensorboard --logdir artifacts/kr106_real/train_dqn/tensorboard
+tensorboard --logdir "$RUN_FOLDER/train_dqn/tensorboard"
 ```
+
+## Development
+
+Run the fast test suite:
+
+```bash
+pytest
+```
+
+Most tests use fakes and avoid real VST, Torch, and CLAP execution. Use the smoke commands for end-to-end validation with a real plugin.
+
+Generated artifacts, model caches, Python bytecode, build metadata, and local virtual environments should stay out of version control. The source tree should focus on `src/`, `tests/`, project metadata, and docs.

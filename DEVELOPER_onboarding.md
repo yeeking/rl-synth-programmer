@@ -16,7 +16,7 @@ This project trains a reinforcement-learning agent to program VST3 instrument pr
 - `src/rl_synth_programmer/cli.py` is the `rl-synth` command-line entrypoint.
 - `tests/` uses small fakes for the host, environment, render pool, and agent so most tests avoid real VST, Torch, or CLAP work.
 
-Generated output normally lives under `artifacts/`. Local CLAP/GPT model files may live under `models/`. These are runtime assets, not source architecture.
+Generated output normally lives under `artifacts/`. Local CLAP/GPT model files are cached under `clap-weights/`. These are runtime assets, not source architecture.
 
 ## Runtime Workflow
 
@@ -115,7 +115,7 @@ reward = previous_distance - new_distance
 
 So positive reward means the rendered sound moved closer to the target embedding.
 
-The CLAP wrapper also supports local/offline model paths used by smoke tests through `models/msclap/` and `models/gpt2/`.
+The CLAP wrapper also supports local/offline model paths used by smoke tests through `clap-weights/CLAP_weights_2023.pth` and `clap-weights/gpt2/`.
 
 ## DQN Agent
 
@@ -228,5 +228,4 @@ Most tests patch heavy dependencies with fakes. The code paths that need real VS
 - Target embedding computation may temporarily restore a preset state on the host, then restore the previous host state.
 - The batched path uses `spawn` multiprocessing, so worker functions and request/result objects must stay pickle-friendly.
 - Keep CLAP in the parent process for batched training unless there is a strong reason to pay for one model per render worker.
-- `assert` is used heavily for user-facing validation in this codebase. If the package is ever run with Python optimization (`-O`), those checks disappear.
-
+- The CLI validates common user-input mistakes before dispatch. Lower-level modules still use `assert` for internal invariants and defensive checks; if the package is ever run with Python optimization (`-O`), those checks disappear.

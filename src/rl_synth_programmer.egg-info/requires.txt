@@ -1,4 +1,5 @@
 numpy>=1.26
+PyYAML>=6.0
 tqdm>=4.66
 
 [dev]
