@@ -45,6 +45,7 @@ class SynthEnvConfig:
     parameter_allowlist: list[str] = field(default_factory=list)
     parameter_denylist: list[str] = field(default_factory=list)
     action_step: float = 0.05
+    action_steps_by_parameter: dict[str, float] = field(default_factory=dict)
     max_episode_steps: int = 24
     success_threshold: float = 0.05
     target_mode: str = "synthetic_pool"

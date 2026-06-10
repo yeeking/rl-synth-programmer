@@ -41,7 +41,7 @@ The usual workflow is:
 
 Training loads that manifest through `TargetPool`, not by scanning the filesystem directly.
 
-`generate-action-dataset` then uses the manifest to create `<run-folder>/action_dataset/dataset.npz`. Each row stores the flattened observation and the immediate reward for every discrete action. It does not currently store per-action next embeddings; action-conditioned feature-change searches therefore use immediate reward/distance improvement as the available feature-change proxy.
+`generate-action-dataset` then uses the manifest to create `<run-folder>/action_dataset/dataset.npz`. It first probes a small global sample of start states to calibrate per-parameter action steps by embedding-distance sensitivity, unless `--no-action-step-calibration` is used. Each row stores the flattened observation and the immediate reward for every discrete action. It does not currently store per-action next embeddings; action-conditioned feature-change searches therefore use immediate reward/distance improvement as the available feature-change proxy.
 
 ## Core Data Model
 
@@ -87,7 +87,7 @@ On `reset()`:
 
 On `step(action)`:
 
-1. The discrete action is decoded into `(parameter_id, signed_delta)`.
+1. The discrete action is decoded into `(parameter_id, signed_delta)`. Offline datasets may use calibrated per-parameter deltas; online RL uses the global action step unless given calibrated steps explicitly.
 2. The selected normalized parameter is clipped into `[0, 1]`.
 3. The host renders a MIDI note.
 4. Audio is embedded.

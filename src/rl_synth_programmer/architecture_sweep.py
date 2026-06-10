@@ -162,13 +162,17 @@ def _cross_validation_splits(
     return splits
 
 
-def _action_features(action_count: int, param_count: int, action_step: float) -> np.ndarray:
+def _action_features(action_count: int, param_count: int, action_step: float, action_deltas: list[float] | None = None) -> np.ndarray:
     rows = []
     denominator = max(1, int(param_count) - 1)
+    if action_deltas is not None:
+        assert len(action_deltas) == int(action_count), (
+            f"metadata action_deltas length {len(action_deltas)} does not match action_count {action_count}."
+        )
     for action in range(int(action_count)):
         parameter_index = action // 2
-        direction = 1.0 if action % 2 == 0 else -1.0
-        rows.append([float(parameter_index / denominator), float(direction * action_step)])
+        signed_delta = float(action_deltas[action]) if action_deltas is not None else float((1.0 if action % 2 == 0 else -1.0) * action_step)
+        rows.append([float(parameter_index / denominator), signed_delta])
     return np.asarray(rows, dtype=np.float32)
 
 
@@ -190,6 +194,9 @@ def _prepare_supervised_arrays(
     param_count = int(metadata["param_count"])
     action_count = int(rewards.shape[1])
     action_step = float(metadata.get("action_step", metadata.get("args", {}).get("action_step", 0.05)))
+    action_deltas = metadata.get("action_deltas")
+    if action_deltas is not None:
+        action_deltas = [float(value) for value in action_deltas]
     row_mask = np.ones((observations.shape[0],), dtype=bool)
     if bool(config.get("exclude_failed_rows", True)):
         if "failed_action_counts" in dataset.files:
@@ -200,7 +207,7 @@ def _prepare_supervised_arrays(
     rewards = rewards[row_mask]
     assert observations.shape[0] > 0, "No rows remain after action-conditioned dataset filtering."
 
-    features = _action_features(action_count, param_count, action_step)
+    features = _action_features(action_count, param_count, action_step, action_deltas)
     expanded_observations = np.repeat(observations, action_count, axis=0)
     expanded_features = np.tile(features, (observations.shape[0], 1))
     expanded_rewards = rewards.reshape(-1, 1).astype(np.float32)

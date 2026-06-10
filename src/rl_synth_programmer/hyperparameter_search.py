@@ -12,10 +12,12 @@ def default_feature_change_search_config(
     epochs: int = 5,
     seeds: tuple[int, ...] = (7, 11),
     cv_folds: int = 1,
+    dataloader_num_workers: int = 2,
 ) -> dict[str, Any]:
     """Return a small CNN/RNN-heavy sweep config for offline action-reward prediction."""
     architectures: list[dict[str, Any]] = []
     for seed in seeds:
+        loader_settings = {"num_workers": int(dataloader_num_workers)}
         architectures.extend(
             [
                 {
@@ -27,6 +29,7 @@ def default_feature_change_search_config(
                     "epochs": epochs,
                     "seed": seed,
                     "dropout": 0.05,
+                    **loader_settings,
                 },
                 {
                     "name": f"cnn-small-s{seed}",
@@ -41,6 +44,7 @@ def default_feature_change_search_config(
                     "epochs": epochs,
                     "seed": seed,
                     "dropout": 0.05,
+                    **loader_settings,
                 },
                 {
                     "name": f"cnn-wide-s{seed}",
@@ -55,6 +59,7 @@ def default_feature_change_search_config(
                     "epochs": epochs,
                     "seed": seed,
                     "dropout": 0.10,
+                    **loader_settings,
                 },
                 {
                     "name": f"gru-small-s{seed}",
@@ -68,6 +73,7 @@ def default_feature_change_search_config(
                     "epochs": epochs,
                     "seed": seed,
                     "dropout": 0.05,
+                    **loader_settings,
                 },
                 {
                     "name": f"gru-bidir-s{seed}",
@@ -82,6 +88,7 @@ def default_feature_change_search_config(
                     "epochs": epochs,
                     "seed": seed,
                     "dropout": 0.05,
+                    **loader_settings,
                 },
                 {
                     "name": f"lstm-small-s{seed}",
@@ -95,6 +102,7 @@ def default_feature_change_search_config(
                     "epochs": epochs,
                     "seed": seed,
                     "dropout": 0.05,
+                    **loader_settings,
                 },
             ]
         )

@@ -336,6 +336,41 @@ def _base_parser() -> argparse.ArgumentParser:
         help="Reload render workers immediately when a render chunk crosses the slowdown threshold. Default: enabled.",
     )
     dataset_parser.add_argument(
+        "--action-step-calibration",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Probe parameter sensitivity and use calibrated per-parameter action steps. Default: enabled.",
+    )
+    dataset_parser.add_argument(
+        "--calibration-probe-states",
+        type=int,
+        default=4,
+        help="Number of target/start states used for action-step calibration. Default: 4.",
+    )
+    dataset_parser.add_argument(
+        "--calibration-probe-deltas",
+        default="0.01,0.1,0.25,0.5",
+        help="Comma-separated normalized deltas to probe for action-step calibration. Default: 0.01,0.1,0.25,0.5.",
+    )
+    dataset_parser.add_argument(
+        "--calibration-reference-delta",
+        type=float,
+        default=0.25,
+        help="Probe delta used to normalize per-parameter calibrated steps. Default: 0.25.",
+    )
+    dataset_parser.add_argument(
+        "--calibration-min-step",
+        type=float,
+        default=0.01,
+        help="Minimum calibrated normalized action step. Default: 0.01.",
+    )
+    dataset_parser.add_argument(
+        "--calibration-max-step",
+        type=float,
+        default=0.5,
+        help="Maximum calibrated normalized action step. Default: 0.5.",
+    )
+    dataset_parser.add_argument(
         "--progress",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -402,6 +437,12 @@ def _base_parser() -> argparse.ArgumentParser:
         type=int,
         default=1,
         help="Grouped cross-validation folds for the generated default config. Use 1 to disable. Ignored when --config is provided. Default: 1.",
+    )
+    search_parser.add_argument(
+        "--dataloader-num-workers",
+        type=int,
+        default=2,
+        help="DataLoader worker count stamped into each generated architecture spec. Ignored when --config is provided. Default: 2.",
     )
     search_parser.add_argument(
         "--progress",
@@ -686,6 +727,10 @@ def _is_nonnegative_float(value: object) -> bool:
     return isinstance(value, (int, float)) and float(value) >= 0.0
 
 
+def _parse_float_csv(value: str) -> list[float]:
+    return [float(item.strip()) for item in str(value).split(",") if item.strip()]
+
+
 def _argument_error(parser: argparse.ArgumentParser, message: str) -> None:
     parser.error(message)
 
@@ -806,6 +851,24 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
             _argument_error(parser, "--reload-workers-every-renders must be an integer >= 0.")
         if not _is_nonnegative_float(args.preset_render_slowdown_threshold):
             _argument_error(parser, "--preset-render-slowdown-threshold must be >= 0.")
+        if not _is_positive_int(args.calibration_probe_states):
+            _argument_error(parser, "--calibration-probe-states must be an integer >= 1.")
+        try:
+            calibration_probe_deltas = _parse_float_csv(args.calibration_probe_deltas)
+        except ValueError:
+            _argument_error(parser, "--calibration-probe-deltas must be a comma-separated list of floats.")
+        if not calibration_probe_deltas or any(delta <= 0.0 for delta in calibration_probe_deltas):
+            _argument_error(parser, "--calibration-probe-deltas must contain positive floats.")
+        if not _is_positive_float(args.calibration_reference_delta):
+            _argument_error(parser, "--calibration-reference-delta must be > 0.")
+        if float(args.calibration_reference_delta) not in calibration_probe_deltas:
+            _argument_error(parser, "--calibration-reference-delta must be included in --calibration-probe-deltas.")
+        if not _is_positive_float(args.calibration_min_step):
+            _argument_error(parser, "--calibration-min-step must be > 0.")
+        if not _is_positive_float(args.calibration_max_step):
+            _argument_error(parser, "--calibration-max-step must be > 0.")
+        if float(args.calibration_max_step) < float(args.calibration_min_step):
+            _argument_error(parser, "--calibration-max-step must be >= --calibration-min-step.")
         _require_existing_run_manifest(parser, args.run_folder, "generate-action-dataset")
     elif args.command == "compare-architectures":
         _require_existing_file(parser, "--dataset", args.dataset)
@@ -815,6 +878,8 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
             _argument_error(parser, "--epochs must be an integer >= 1.")
         if not _is_positive_int(args.cv_folds):
             _argument_error(parser, "--cv-folds must be an integer >= 1.")
+        if not _is_nonnegative_int(args.dataloader_num_workers):
+            _argument_error(parser, "--dataloader-num-workers must be an integer >= 0.")
         if args.config is not None:
             _require_existing_file(parser, "--config", args.config)
         if args.dataset:
@@ -1029,6 +1094,12 @@ def _cmd_generate_action_dataset(
     reload_workers_every_renders: int,
     preset_render_slowdown_threshold: float,
     reload_workers_on_render_slowdown: bool,
+    action_step_calibration: bool,
+    calibration_probe_states: int,
+    calibration_probe_deltas: str,
+    calibration_reference_delta: float,
+    calibration_min_step: float,
+    calibration_max_step: float,
 ) -> None:
     run_root = _resolve_run_folder(run_folder, create=True)
     manifest_path = _find_manifest(run_root)
@@ -1049,6 +1120,12 @@ def _cmd_generate_action_dataset(
         reload_workers_every_renders=reload_workers_every_renders,
         preset_render_slowdown_threshold=preset_render_slowdown_threshold,
         reload_workers_on_render_slowdown=reload_workers_on_render_slowdown,
+        action_step_calibration=action_step_calibration,
+        calibration_probe_states=calibration_probe_states,
+        calibration_probe_deltas=tuple(_parse_float_csv(calibration_probe_deltas)),
+        calibration_reference_delta=calibration_reference_delta,
+        calibration_min_step=calibration_min_step,
+        calibration_max_step=calibration_max_step,
     )
     estimate = estimate_action_dataset(config, progress=progress)
     if estimate_only:
@@ -1082,6 +1159,7 @@ def _cmd_search_feature_change_models(
     out_dir: str,
     epochs: int,
     cv_folds: int,
+    dataloader_num_workers: int,
     progress: bool,
     tensorboard: bool,
 ) -> None:
@@ -1092,7 +1170,11 @@ def _cmd_search_feature_change_models(
     if config_path is not None:
         config = json.loads(Path(config_path).read_text())
     else:
-        config = default_feature_change_search_config(epochs=epochs, cv_folds=cv_folds)
+        config = default_feature_change_search_config(
+            epochs=epochs,
+            cv_folds=cv_folds,
+            dataloader_num_workers=dataloader_num_workers,
+        )
     result = run_feature_change_search(
         datasets,
         _resolve_run_folder(out_dir, create=True),
@@ -1174,6 +1256,12 @@ def main() -> None:
                 args.reload_workers_every_renders,
                 args.preset_render_slowdown_threshold,
                 args.reload_workers_on_render_slowdown,
+                args.action_step_calibration,
+                args.calibration_probe_states,
+                args.calibration_probe_deltas,
+                args.calibration_reference_delta,
+                args.calibration_min_step,
+                args.calibration_max_step,
             )
         elif args.command == "compare-architectures":
             _cmd_compare_architectures(
@@ -1191,6 +1279,7 @@ def main() -> None:
                 args.out_dir,
                 args.epochs,
                 args.cv_folds,
+                args.dataloader_num_workers,
                 args.progress,
                 args.tensorboard,
             )

@@ -195,7 +195,8 @@ class BatchedRolloutCoordinator:
         parameter_index = action // 2
         direction = 1.0 if action % 2 == 0 else -1.0
         parameter_id = self.parameter_specs[parameter_index].stable_id
-        return parameter_id, direction * self.config.action_step
+        action_step = float(self.config.action_steps_by_parameter.get(parameter_id, self.config.action_step))
+        return parameter_id, direction * action_step
 
     def preset_start_candidates(self, target: TargetSpec) -> list[TargetSpec]:
         same_split = [

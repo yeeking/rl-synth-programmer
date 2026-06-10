@@ -102,6 +102,30 @@ class SlowHighParamRenderPool(FakeRenderPool):
         return super().render_batch(requests)
 
 
+class SensitivityRenderPool(FakeRenderPool):
+    def render_batch(self, requests, timeout_seconds=None):
+        from rl_synth_programmer.parallel_rollout import RenderResult
+
+        _ = timeout_seconds
+        preset_params = {
+            b"a": {"cutoff": 1.0, "resonance": 0.0},
+            b"b": {"cutoff": 0.0, "resonance": 1.0},
+            b"c": {"cutoff": 0.9, "resonance": 0.9},
+        }
+        results = []
+        for request in requests:
+            params = preset_params.get(request.preset_state, request.parameters or {})
+            audio = np.array(
+                [
+                    1.0 + float(params.get("cutoff", 0.0)),
+                    1.0 + 0.1 * float(params.get("resonance", 0.0)),
+                ],
+                dtype=np.float32,
+            )
+            results.append(RenderResult(request.slot_id, 123, audio, 44_100, 0.001))
+        return results
+
+
 class CountingRenderPool(FakeRenderPool):
     opened = 0
     closed = 0
@@ -238,7 +262,74 @@ class OfflineDatasetTests(unittest.TestCase):
             self.assertEqual(metadata["param_count"], 2)
             self.assertEqual(metadata["embedding_size"], 2)
             self.assertEqual(metadata["shapes"]["action_rewards"], [2, 4])
+            self.assertEqual(metadata["action_step_mode"], "calibrated")
+            self.assertEqual(len(metadata["action_deltas"]), 4)
+            self.assertIn("cutoff", metadata["action_step_by_parameter"])
+            self.assertIn("action_step_calibration", metadata)
             self.assertTrue((root / "action_dataset" / "shards" / "shard-00000.npz").exists())
+
+    def test_generate_action_dataset_calibrates_larger_steps_for_less_sensitive_parameters(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest_path = _write_manifest(root)
+            config = ActionDatasetConfig(
+                plugin_path=Path("dummy.vst3"),
+                manifest_path=manifest_path,
+                output_dir=root,
+                max_states=1,
+                moves_per_start=1,
+                calibration_probe_states=1,
+                preset_render_slowdown_threshold=0.0,
+            )
+            estimate = {
+                "estimated_total_renders": 100,
+                "sample_states": 1,
+                "action_count": 4,
+                "observation_size": 8,
+                "seconds_per_state": 0.01,
+                "estimated_seconds": 0.02,
+                "estimated_npz_bytes": 100,
+            }
+            with patch("rl_synth_programmer.offline_dataset.SynthHost", FakeHost):
+                with patch("rl_synth_programmer.offline_dataset.ParallelRenderPool", SensitivityRenderPool):
+                    with patch("rl_synth_programmer.offline_dataset.build_embedder", return_value=FakeEmbedder()):
+                        result = generate_action_dataset(config, progress=False, yes=True, estimate=estimate)
+            metadata = json.loads(Path(result["metadata_path"]).read_text())
+            cutoff_step = float(metadata["action_step_by_parameter"]["cutoff"])
+            resonance_step = float(metadata["action_step_by_parameter"]["resonance"])
+            self.assertGreater(resonance_step, cutoff_step)
+            self.assertEqual(metadata["action_deltas"], [cutoff_step, -cutoff_step, resonance_step, -resonance_step])
+
+    def test_generate_action_dataset_can_disable_action_step_calibration(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest_path = _write_manifest(root)
+            config = ActionDatasetConfig(
+                plugin_path=Path("dummy.vst3"),
+                manifest_path=manifest_path,
+                output_dir=root,
+                max_states=1,
+                moves_per_start=1,
+                action_step=0.05,
+                action_step_calibration=False,
+                preset_render_slowdown_threshold=0.0,
+            )
+            estimate = {
+                "estimated_total_renders": 10,
+                "sample_states": 1,
+                "action_count": 4,
+                "observation_size": 8,
+                "seconds_per_state": 0.01,
+                "estimated_seconds": 0.02,
+                "estimated_npz_bytes": 100,
+            }
+            with patch("rl_synth_programmer.offline_dataset.SynthHost", FakeHost):
+                with patch("rl_synth_programmer.offline_dataset.ParallelRenderPool", FakeRenderPool):
+                    with patch("rl_synth_programmer.offline_dataset.build_embedder", return_value=FakeEmbedder()):
+                        result = generate_action_dataset(config, progress=False, yes=True, estimate=estimate)
+            metadata = json.loads(Path(result["metadata_path"]).read_text())
+            self.assertEqual(metadata["action_step_mode"], "fixed")
+            self.assertEqual(metadata["action_deltas"], [0.05, -0.05, 0.05, -0.05])
 
     def test_generate_action_dataset_samples_pairs_round_robin(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

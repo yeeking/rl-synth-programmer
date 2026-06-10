@@ -95,6 +95,12 @@ class CliLoggingOptionsTest(unittest.TestCase):
         self.assertEqual(args.reload_workers_every_renders, 500)
         self.assertEqual(args.preset_render_slowdown_threshold, 1.5)
         self.assertTrue(args.reload_workers_on_render_slowdown)
+        self.assertTrue(args.action_step_calibration)
+        self.assertEqual(args.calibration_probe_states, 4)
+        self.assertEqual(args.calibration_probe_deltas, "0.01,0.1,0.25,0.5")
+        self.assertEqual(args.calibration_reference_delta, 0.25)
+        self.assertEqual(args.calibration_min_step, 0.01)
+        self.assertEqual(args.calibration_max_step, 0.5)
         self.assertTrue(args.progress)
 
     def test_compare_architectures_parser_defaults(self) -> None:
@@ -125,6 +131,7 @@ class CliLoggingOptionsTest(unittest.TestCase):
         self.assertEqual(args.out_dir, "architecture_search/feature_change")
         self.assertEqual(args.epochs, 5)
         self.assertEqual(args.cv_folds, 1)
+        self.assertEqual(args.dataloader_num_workers, 2)
         self.assertTrue(args.progress)
         self.assertFalse(args.tensorboard)
 

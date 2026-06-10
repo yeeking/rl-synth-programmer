@@ -14,7 +14,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from rl_synth_programmer.architecture_sweep import compare_architectures, load_sweep_config
+from rl_synth_programmer.architecture_sweep import _prepare_supervised_arrays, compare_architectures, load_sweep_config
 
 
 class ArchitectureSweepTests(unittest.TestCase):
@@ -182,6 +182,30 @@ class ArchitectureSweepTests(unittest.TestCase):
             self.assertIn("top1_accuracy", metrics["val"])
             self.assertIn("top5_accuracy", metrics["val"])
             self.assertIn("mean_regret", metrics["val"])
+
+    def test_action_conditioned_features_use_metadata_action_deltas(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            observations = np.zeros((2, 8), dtype=np.float32)
+            action_rewards = np.zeros((2, 4), dtype=np.float32)
+            dataset_path = root / "dataset.npz"
+            np.savez_compressed(
+                dataset_path,
+                observations=observations,
+                action_rewards=action_rewards,
+                failed_action_counts=np.zeros((2,), dtype=np.int32),
+                state_skipped=np.zeros((2,), dtype=np.int32),
+            )
+            dataset = np.load(dataset_path)
+            prepared_observations, _prepared_rewards, _metadata, _group_ids, action_ids = _prepare_supervised_arrays(
+                dataset,
+                {"param_count": 2, "action_step": 0.05, "action_deltas": [0.3, -0.3, 0.05, -0.05]},
+                {"target": "action_reward_as_feature_change_proxy"},
+            )
+            signed_delta_column = prepared_observations[:, -1]
+            expected = np.asarray([0.3, -0.3, 0.05, -0.05, 0.3, -0.3, 0.05, -0.05], dtype=np.float32)
+            self.assertTrue(np.allclose(signed_delta_column, expected))
+            self.assertTrue(np.array_equal(action_ids, np.tile(np.arange(4, dtype=np.int32), 2)))
 
     def test_compare_architectures_supports_grouped_cross_validation(self) -> None:
         if importlib.util.find_spec("torch") is None:

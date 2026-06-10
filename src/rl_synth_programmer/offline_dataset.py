@@ -45,6 +45,8 @@ class ActionDatasetConfig:
         prior running mean by this multiplier. Use 0 to disable.
     reload_workers_on_render_slowdown: reload workers immediately when one render chunk crosses
         preset_render_slowdown_threshold. If false, assert at the first slow chunk.
+    action_step_calibration: probe start states and replace the global action_step with
+        per-parameter steps normalized by embedding-distance sensitivity.
     """
 
     plugin_path: Path
@@ -66,6 +68,13 @@ class ActionDatasetConfig:
     reload_workers_every_renders: int = 500
     preset_render_slowdown_threshold: float = 1.5
     reload_workers_on_render_slowdown: bool = True
+    action_step_calibration: bool = True
+    calibration_probe_states: int = 4
+    calibration_probe_deltas: tuple[float, ...] = (0.01, 0.1, 0.25, 0.5)
+    calibration_reference_delta: float = 0.25
+    calibration_min_step: float = 0.01
+    calibration_max_step: float = 0.5
+    calibration_epsilon: float = 1e-8
 
 
 @dataclass(slots=True)
@@ -191,6 +200,177 @@ def _render_start_state(
     distance = coordinator.distance_model.distance(np.asarray(embedding, dtype=np.float32), target.embedding)
     observation = coordinator.flatten_observation(np.asarray(embedding, dtype=np.float32), target.embedding, params)
     return params, np.asarray(embedding, dtype=np.float32), float(distance), observation
+
+
+def _action_deltas(coordinator: BatchedRolloutCoordinator) -> list[float]:
+    return [float(coordinator.decode_action(action)[1]) for action in range(coordinator.action_size)]
+
+
+def _calibrate_action_steps(
+    coordinator: BatchedRolloutCoordinator,
+    render_pool: ParallelRenderPool,
+    embedder,
+    targets: list[TargetSpec],
+    pairs: list[tuple[int, int]],
+    config: ActionDatasetConfig,
+    *,
+    progress: bool,
+    reload_after_rendered: Callable[[int, Any], Any] | None = None,
+) -> tuple[dict[str, float], dict[str, Any]]:
+    parameter_ids = [spec.stable_id for spec in coordinator.parameter_specs]
+    fixed_steps = {parameter_id: float(config.action_step) for parameter_id in parameter_ids}
+    probe_deltas = [float(delta) for delta in config.calibration_probe_deltas]
+    reference_delta = float(config.calibration_reference_delta)
+    assert probe_deltas, "calibration_probe_deltas must contain at least one delta."
+    assert reference_delta in probe_deltas, "calibration_reference_delta must be present in calibration_probe_deltas."
+    assert config.calibration_probe_states >= 1, "calibration_probe_states must be >= 1."
+    assert config.calibration_min_step > 0.0, "calibration_min_step must be > 0."
+    assert config.calibration_max_step >= config.calibration_min_step, "calibration_max_step must be >= calibration_min_step."
+
+    if not config.action_step_calibration:
+        return fixed_steps, {
+            "enabled": False,
+            "probe_deltas": probe_deltas,
+            "reference_delta": reference_delta,
+            "probe_state_count": 0,
+            "per_parameter_effects": {parameter_id: {} for parameter_id in parameter_ids},
+            "target_effect": None,
+            "clipped_min_count": 0,
+            "clipped_max_count": 0,
+            "failed_probe_count": 0,
+        }
+
+    selected_pairs = pairs[: min(int(config.calibration_probe_states), len(pairs))]
+    stage_log(
+        "Calibrating per-parameter action steps: "
+        f"states={len(selected_pairs)} params={len(parameter_ids)} deltas={probe_deltas}."
+    )
+    effects: dict[str, dict[str, list[float]]] = {
+        parameter_id: {str(delta): [] for delta in probe_deltas}
+        for parameter_id in parameter_ids
+    }
+    actual_deltas: dict[str, dict[str, list[float]]] = {
+        parameter_id: {str(delta): [] for delta in probe_deltas}
+        for parameter_id in parameter_ids
+    }
+    failed_probe_count = 0
+    rendered_probe_count = 0
+    total_probes = len(selected_pairs) * len(parameter_ids) * len(probe_deltas) * 2
+    progress_bar = make_progress_bar(total=total_probes, desc="calibration renders", enabled=progress)
+    chunk_size = int(config.render_chunk_size) if int(config.render_chunk_size) > 0 else int(config.num_workers)
+    chunk_size = max(1, chunk_size)
+    for target_index, start_index in selected_pairs:
+        target = targets[target_index]
+        start = targets[start_index]
+        baseline_params, baseline_embedding, _distance, _observation = _render_start_state(
+            coordinator,
+            render_pool,
+            embedder,
+            target,
+            start,
+            batch_size=config.clap_batch_size,
+            timeout_seconds=config.render_timeout_seconds,
+        )
+        requests: list[RenderRequest] = []
+        probe_records: list[tuple[str, float, float]] = []
+        for parameter_id in parameter_ids:
+            baseline_value = float(baseline_params[parameter_id])
+            for delta in probe_deltas:
+                for direction in (1.0, -1.0):
+                    next_params = dict(baseline_params)
+                    next_value = float(np.clip(baseline_value + direction * delta, 0.0, 1.0))
+                    next_params[parameter_id] = next_value
+                    probe_records.append((parameter_id, float(delta), float(next_value - baseline_value)))
+                    requests.append(
+                        RenderRequest(
+                            slot_id=len(probe_records) - 1,
+                            render_mode="parameter_state",
+                            parameters=next_params,
+                        )
+                    )
+        for start_offset in range(0, len(requests), chunk_size):
+            request_chunk = requests[start_offset : start_offset + chunk_size]
+            try:
+                results = _render_batch(render_pool, request_chunk, timeout_seconds=config.render_timeout_seconds)
+            except TimeoutError:
+                failed_probe_count += len(request_chunk)
+                progress_bar.update(len(request_chunk))
+                if not config.skip_failed_actions:
+                    raise
+                continue
+            embeddings = embed_audio_batch(
+                embedder,
+                [result.audio for result in results],
+                [result.sample_rate for result in results],
+                fallback_size=len(coordinator.parameter_specs),
+                batch_size=max(1, config.clap_batch_size),
+            )
+            for result, embedding in zip(results, embeddings):
+                parameter_id, requested_delta, actual_delta = probe_records[int(result.slot_id)]
+                if abs(actual_delta) <= 1e-12:
+                    continue
+                effect = coordinator.distance_model.distance(
+                    np.asarray(embedding, dtype=np.float32),
+                    np.asarray(baseline_embedding, dtype=np.float32),
+                )
+                effects[parameter_id][str(requested_delta)].append(float(effect))
+                actual_deltas[parameter_id][str(requested_delta)].append(float(abs(actual_delta)))
+            rendered_probe_count += len(results)
+            progress_bar.update(len(results))
+            if reload_after_rendered is not None:
+                render_pool = reload_after_rendered(len(results), render_pool)
+    progress_bar.close()
+
+    reference_key = str(reference_delta)
+    reference_effects = {
+        parameter_id: float(np.mean(values[reference_key]))
+        for parameter_id, values in effects.items()
+        if values[reference_key]
+    }
+    valid_effects = [value for value in reference_effects.values() if np.isfinite(value) and value > 0.0]
+    target_effect = float(np.mean(valid_effects)) if valid_effects else float(reference_delta)
+    clipped_min_count = 0
+    clipped_max_count = 0
+    steps: dict[str, float] = {}
+    for parameter_id in parameter_ids:
+        effect = reference_effects.get(parameter_id, 0.0)
+        raw_step = reference_delta * target_effect / max(float(effect), float(config.calibration_epsilon))
+        step = float(np.clip(raw_step, float(config.calibration_min_step), float(config.calibration_max_step)))
+        clipped_min_count += int(step <= float(config.calibration_min_step) and raw_step < float(config.calibration_min_step))
+        clipped_max_count += int(step >= float(config.calibration_max_step) and raw_step > float(config.calibration_max_step))
+        steps[parameter_id] = step
+
+    per_parameter_effects = {
+        parameter_id: {
+            "step": float(steps[parameter_id]),
+            "reference_effect": float(reference_effects.get(parameter_id, 0.0)),
+            "effects": {
+                delta_key: float(np.mean(delta_values)) if delta_values else None
+                for delta_key, delta_values in values.items()
+            },
+            "probe_counts": {delta_key: int(len(delta_values)) for delta_key, delta_values in values.items()},
+            "mean_actual_deltas": {
+                delta_key: float(np.mean(delta_values)) if delta_values else None
+                for delta_key, delta_values in actual_deltas[parameter_id].items()
+            },
+        }
+        for parameter_id, values in effects.items()
+    }
+    return steps, {
+        "enabled": True,
+        "probe_deltas": probe_deltas,
+        "reference_delta": reference_delta,
+        "probe_state_count": len(selected_pairs),
+        "per_parameter_effects": per_parameter_effects,
+        "target_effect": target_effect,
+        "clipped_min_count": int(clipped_min_count),
+        "clipped_max_count": int(clipped_max_count),
+        "failed_probe_count": int(failed_probe_count),
+        "rendered_probe_count": int(rendered_probe_count),
+        "min_step": float(config.calibration_min_step),
+        "max_step": float(config.calibration_max_step),
+        "epsilon": float(config.calibration_epsilon),
+    }
 
 
 def _evaluate_all_actions(
@@ -380,7 +560,11 @@ def estimate_action_dataset(config: ActionDatasetConfig, *, progress: bool = Tru
     sample_states = _sample_state_count(config, pairs)
     observation_size = 3 * int(targets[target_index].embedding.shape[0]) + len(parameter_specs)
     action_count = int(rewards.shape[0])
-    total_renders = int(sample_states * action_count + len(targets) + sample_states)
+    calibration_probe_states = min(int(config.calibration_probe_states), len(pairs)) if config.action_step_calibration else 0
+    calibration_renders = int(
+        calibration_probe_states * (1 + len(parameter_specs) * len(tuple(config.calibration_probe_deltas)) * 2)
+    )
+    total_renders = int(sample_states * action_count + len(targets) + sample_states + calibration_renders)
     estimated_npz_bytes = int(sample_states * (observation_size + action_count + 6) * np.dtype(np.float32).itemsize)
     estimate = {
         "target_count": len(targets),
@@ -391,6 +575,7 @@ def estimate_action_dataset(config: ActionDatasetConfig, *, progress: bool = Tru
         "seconds_per_state": float(seconds_per_state),
         "estimated_seconds": float(seconds_per_state * sample_states),
         "estimated_total_renders": total_renders,
+        "estimated_calibration_renders": calibration_renders,
         "estimated_npz_bytes": estimated_npz_bytes,
         "sample_best_reward": float(np.max(rewards)),
         "num_workers": int(config.num_workers),
@@ -400,6 +585,8 @@ def estimate_action_dataset(config: ActionDatasetConfig, *, progress: bool = Tru
         "reload_workers_every_renders": int(config.reload_workers_every_renders),
         "preset_render_slowdown_threshold": float(config.preset_render_slowdown_threshold),
         "reload_workers_on_render_slowdown": bool(config.reload_workers_on_render_slowdown),
+        "action_step_calibration": bool(config.action_step_calibration),
+        "calibration_probe_states": int(config.calibration_probe_states),
         "sampling_scheme": "round_robin_greedy",
         "memory": _memory_snapshot(),
     }
@@ -608,6 +795,17 @@ def generate_action_dataset(
         assert pairs, "Manifest must contain at least two preset-state targets for preset-pair dataset generation."
         target_ids = [target.target_id for target in targets]
         total_states = _sample_state_count(config, pairs)
+        action_steps_by_parameter, calibration_metadata = _calibrate_action_steps(
+            coordinator,
+            render_pool,
+            embedder,
+            targets,
+            pairs,
+            config,
+            progress=progress,
+            reload_after_rendered=_reload_after_rendered,
+        )
+        coordinator.config.action_steps_by_parameter = dict(action_steps_by_parameter)
         total_action_renders = total_states * int(coordinator.action_size)
         progress_bar = make_progress_bar(total=total_action_renders, desc="action renders", enabled=progress)
         pair_states: dict[int, _PairRolloutState] = {}
@@ -777,6 +975,10 @@ def generate_action_dataset(
         "manifest_path": str(config.manifest_path),
         "reward_mode": config.reward_mode,
         "action_step": float(config.action_step),
+        "action_step_mode": "calibrated" if bool(config.action_step_calibration) else "fixed",
+        "action_step_by_parameter": {spec.stable_id: float(coordinator.config.action_steps_by_parameter[spec.stable_id]) for spec in parameter_specs},
+        "action_deltas": _action_deltas(coordinator),
+        "action_step_calibration": calibration_metadata,
         "parameter_ids": [spec.stable_id for spec in parameter_specs],
         "target_ids": target_ids,
         "observation_layout": {
@@ -809,6 +1011,12 @@ def generate_action_dataset(
             "reload_workers_every_renders": int(config.reload_workers_every_renders),
             "preset_render_slowdown_threshold": float(config.preset_render_slowdown_threshold),
             "reload_workers_on_render_slowdown": bool(config.reload_workers_on_render_slowdown),
+            "action_step_calibration": bool(config.action_step_calibration),
+            "calibration_probe_states": int(config.calibration_probe_states),
+            "calibration_probe_deltas": [float(delta) for delta in config.calibration_probe_deltas],
+            "calibration_reference_delta": float(config.calibration_reference_delta),
+            "calibration_min_step": float(config.calibration_min_step),
+            "calibration_max_step": float(config.calibration_max_step),
         },
         "shards": [str(path) for path in shard_paths],
     }

@@ -58,6 +58,7 @@ rl-synth generate-action-dataset \
   --moves-per-start 8 \
   --num-workers 4 \
   --clap-batch-size 8 \
+  --action-step-calibration \
   --render-timeout-seconds 300 \
   --max-state-seconds 90 \
   --shard-size 16 \
@@ -89,6 +90,7 @@ rl-synth search-feature-change-models \
   --artifacts-root artifacts \
   --out-dir artifacts/architecture_search/feature_change \
   --epochs 5 \
+  --dataloader-num-workers 2 \
   --tensorboard
 ```
 
@@ -124,7 +126,7 @@ rl-synth compare-architectures --dataset "$RUN_FOLDER/action_dataset/dataset.npz
 rl-synth random-agent --plugin "$SYNTH_PLUGIN" --run-folder "$RUN_FOLDER" --episodes 4
 rl-synth train-dqn --plugin "$SYNTH_PLUGIN" --run-folder "$RUN_FOLDER" --reward-mode clap --steps 2000
 rl-synth evaluate --plugin "$SYNTH_PLUGIN" --run-folder "$RUN_FOLDER" --episodes 8
-rl-synth search-feature-change-models --artifacts-root artifacts --out-dir artifacts/architecture_search/feature_change --epochs 5 --cv-folds 1
+rl-synth search-feature-change-models --artifacts-root artifacts --out-dir artifacts/architecture_search/feature_change --epochs 5 --cv-folds 1 --dataloader-num-workers 2
 rl-synth full-smoke --plugin "$SYNTH_PLUGIN" --run-folder artifacts/full_smoke
 ```
 
@@ -132,13 +134,17 @@ rl-synth full-smoke --plugin "$SYNTH_PLUGIN" --run-folder artifacts/full_smoke
 
 ## Offline Dataset Details
 
-`generate-action-dataset` samples target/start preset pairs round-robin. It renders move 0 for each pair first, then move 1 for each pair, up to `--moves-per-start` or `--max-states`. For every sampled state, it evaluates every discrete action and stores:
+`generate-action-dataset` samples target/start preset pairs round-robin. Before rollout, it probes a few start states to calibrate per-parameter action steps by embedding-distance sensitivity. Parameters that need larger normalized movement to change the sound get larger steps; highly sensitive parameters get smaller steps. Use `--no-action-step-calibration` to keep the fixed global `--action-step` behavior.
+
+It renders move 0 for each pair first, then move 1 for each pair, up to `--moves-per-start` or `--max-states`. For every sampled state, it evaluates every discrete action and stores:
 
 - `observations`: flattened `[target_embedding, current_embedding, delta_embedding, params]`
 - `action_rewards`: immediate reward for each action
 - `current_distances`, target/start indices, move indices, best actions, and render diagnostics
 
 Long runs write recoverable shards under `<run-folder>/action_dataset/shards/` before merging the final `<run-folder>/action_dataset/dataset.npz`. Metadata and summary files are written next to the dataset.
+
+Calibration metadata includes `action_step_mode`, `action_step_by_parameter`, action-indexed `action_deltas`, and the probe summary under `action_step_calibration`. Downstream action-conditioned sweeps use `action_deltas` when present.
 
 Useful reliability options:
 
@@ -148,6 +154,7 @@ Useful reliability options:
 - `--reload-workers-every-renders`: periodically reload plugin worker processes
 - `--preset-render-slowdown-threshold`: detect sudden per-action render slowdowns
 - `--reload-workers-on-render-slowdown` / `--no-reload-workers-on-render-slowdown`: reload workers or assert on slowdown
+- `--calibration-probe-states`, `--calibration-probe-deltas`, `--calibration-reference-delta`, `--calibration-min-step`, `--calibration-max-step`: tune action-step calibration
 
 ## Architecture Sweep
 
