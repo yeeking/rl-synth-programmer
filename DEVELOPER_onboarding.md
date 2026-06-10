@@ -12,6 +12,10 @@ This project trains a reinforcement-learning agent to program VST3 instrument pr
 - `src/rl_synth_programmer/agent.py` implements random policy, replay buffer, and DQN.
 - `src/rl_synth_programmer/training.py` contains single-env and batched DQN training plus evaluation.
 - `src/rl_synth_programmer/parallel_rollout.py` contains multiprocessing render workers and the batched rollout coordinator.
+- `src/rl_synth_programmer/offline_dataset.py` generates all-actions offline reward datasets from target/start preset pairs.
+- `src/rl_synth_programmer/networks.py` builds MLP, residual MLP, CNN, GRU, and LSTM action-value networks.
+- `src/rl_synth_programmer/architecture_sweep.py` trains and ranks supervised action-value or action-conditioned reward predictors.
+- `src/rl_synth_programmer/hyperparameter_search.py` discovers action datasets and runs the default CNN/RNN-heavy search across them.
 - `src/rl_synth_programmer/smoke.py` contains end-to-end smoke workflows and artifact writers.
 - `src/rl_synth_programmer/cli.py` is the `rl-synth` command-line entrypoint.
 - `tests/` uses small fakes for the host, environment, render pool, and agent so most tests avoid real VST, Torch, or CLAP work.
@@ -24,8 +28,10 @@ The usual workflow is:
 
 1. Inspect a VST3 plugin with `rl-synth inspect-plugin`.
 2. Generate a target set with `rl-synth generate-target-set`.
-3. Train with `rl-synth train-dqn`.
-4. Evaluate with `rl-synth evaluate`.
+3. Generate an offline all-actions dataset with `rl-synth generate-action-dataset`.
+4. Compare supervised architectures with `rl-synth compare-architectures` or `rl-synth search-feature-change-models`.
+5. Train with `rl-synth train-dqn`.
+6. Evaluate with `rl-synth evaluate`.
 
 `generate-target-set` discovers program/preset states through `SynthHost.enumerate_program_states()`. Each captured target stores:
 
@@ -34,6 +40,8 @@ The usual workflow is:
 - metadata in `targets/manifest.json` and `targets/manifest.csv`
 
 Training loads that manifest through `TargetPool`, not by scanning the filesystem directly.
+
+`generate-action-dataset` then uses the manifest to create `<run-folder>/action_dataset/dataset.npz`. Each row stores the flattened observation and the immediate reward for every discrete action. It does not currently store per-action next embeddings; action-conditioned feature-change searches therefore use immediate reward/distance improvement as the available feature-change proxy.
 
 ## Core Data Model
 
@@ -173,6 +181,49 @@ The design keeps VST rendering parallel while avoiding one CLAP model per worker
 
 Target embeddings are precomputed at startup by `_prime_target_embeddings()` so each step only embeds current audio.
 
+## Offline Architecture Search
+
+There are two supervised search modes.
+
+`compare-architectures` reads one `action_dataset/dataset.npz` and a JSON config. By default, it predicts the full per-action reward vector from each stored observation:
+
+```text
+observation -> action_rewards
+```
+
+If the config contains `"target": "action_reward_as_feature_change_proxy"`, it expands the dataset into action-conditioned examples:
+
+```text
+[observation, parameter_index_normalized, signed_delta] -> immediate_reward
+```
+
+This mode preserves grouped train/val/test splits by original source row to avoid leaking actions from the same state across splits. By default the generated hypersearch config also excludes rows with failed action renders.
+
+`search-feature-change-models` wraps this for public experiments. It discovers all `*/action_dataset/dataset.npz` files under `artifacts/`, writes a generated CNN/RNN-heavy `search_config.json`, runs each dataset, and emits:
+
+```text
+combined_leaderboard.md
+combined_leaderboard.csv
+combined_leaderboard.json
+```
+
+The latest local initial run used:
+
+```bash
+.venv/bin/rl-synth search-feature-change-models \
+  --artifacts-root artifacts \
+  --out-dir artifacts/architecture_search/feature_change_action_conditioned_initial \
+  --epochs 5 \
+  --no-progress
+```
+
+Headline results from that run:
+
+- `dexed_real`: `cnn-small-s7`, validation regret `0.159846`, validation MSE `0.0102375`
+- `ultra_real`: `lstm-small-s7`, validation regret `0.07357`, validation MSE `0.000388206`
+
+For a longer GPU-server rerun, increase `--epochs`, optionally remove or raise `max_expanded_rows` in the generated config, and consider enabling `--tensorboard`.
+
 ## CLI and Artifacts
 
 The CLI always resolves user-facing run folders under `artifacts/`. Passing either `my_run` or `artifacts/my_run` resolves to `artifacts/my_run`.
@@ -192,6 +243,11 @@ artifacts/<run>/
   smoke_random_env/
   smoke_train_clap/
   smoke_evaluate/
+  action_dataset/
+    dataset.npz
+    metadata.json
+    summary.json
+    shards/
 ```
 
 The CLI helper functions `_find_manifest()`, `_find_train_checkpoint()`, and `_find_smoke_checkpoint()` enforce the expected workflow and produce user-facing error messages.
@@ -217,6 +273,8 @@ Most tests patch heavy dependencies with fakes. The code paths that need real VS
 - To change action semantics, edit `_decode_action()` in `env.py` and `decode_action()` in `parallel_rollout.py`. Keep them behaviorally identical.
 - To change observation contents, edit `_flatten_observation()` in `env.py` and `flatten_observation()` in `parallel_rollout.py`.
 - To change reward math, edit `SimilarityRewardModel` or the reward branch in both environment/coordinator step application.
+- To change CNN/RNN supervised model shapes, edit `networks.py` and update architecture validation in `architecture_sweep.py`.
+- To change the default multi-dataset hyperparameter search, edit `default_feature_change_search_config()` in `hyperparameter_search.py`.
 - To change target scheduling, edit `TargetPool`.
 - To add a CLI option, update `_base_parser()`, `_cmd_*`, and `_experiment_config()` if it affects runtime config.
 - To add new training metrics, update both `train_dqn()` and `train_dqn_batched()` when the metric applies to both paths.

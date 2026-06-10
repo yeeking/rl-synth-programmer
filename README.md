@@ -123,6 +123,7 @@ rl-synth compare-architectures --dataset "$RUN_FOLDER/action_dataset/dataset.npz
 rl-synth random-agent --plugin "$SYNTH_PLUGIN" --run-folder "$RUN_FOLDER" --episodes 4
 rl-synth train-dqn --plugin "$SYNTH_PLUGIN" --run-folder "$RUN_FOLDER" --reward-mode clap --steps 2000
 rl-synth evaluate --plugin "$SYNTH_PLUGIN" --run-folder "$RUN_FOLDER" --episodes 8
+rl-synth search-feature-change-models --artifacts-root artifacts --out-dir artifacts/architecture_search/feature_change --epochs 5
 rl-synth full-smoke --plugin "$SYNTH_PLUGIN" --run-folder artifacts/full_smoke
 ```
 
@@ -181,7 +182,7 @@ Example `sweep.json`:
 }
 ```
 
-Supported architecture types are `mlp`, `residual_mlp`, `cnn1d`, and `hybrid_cnn_mlp`. The sweep writes per-architecture checkpoints and metrics plus `leaderboard.json` and `leaderboard.csv`.
+Supported architecture types are `mlp`, `residual_mlp`, `cnn1d`, `hybrid_cnn_mlp`, `rnn`, `gru`, and `lstm`. The sweep writes per-architecture checkpoints and metrics plus `leaderboard.json` and `leaderboard.csv`.
 
 `search-feature-change-models` generates a compact CNN/RNN-heavy config and runs it across all discovered `*/action_dataset/dataset.npz` files. It uses the stored immediate reward as a feature-change proxy because the current dataset format stores all-action rewards but not per-action next embeddings. The action-conditioned input is:
 
@@ -198,6 +199,40 @@ The combined results are written to:
 ```
 
 For a longer GPU-server rerun, increase `--epochs`, remove or raise `max_expanded_rows` in the generated `search_config.json`, and optionally enable `--tensorboard`.
+
+### Latest Initial Search
+
+The latest local action-conditioned search was run with:
+
+```bash
+.venv/bin/rl-synth search-feature-change-models \
+  --artifacts-root artifacts \
+  --out-dir artifacts/architecture_search/feature_change_action_conditioned_initial \
+  --epochs 5 \
+  --no-progress
+```
+
+It discovered:
+
+- `artifacts/dexed_real/action_dataset/dataset.npz`
+- `artifacts/ultra_real/action_dataset/dataset.npz`
+
+The combined result table is in:
+
+```text
+artifacts/architecture_search/feature_change_action_conditioned_initial/combined_leaderboard.md
+artifacts/architecture_search/feature_change_action_conditioned_initial/combined_leaderboard.csv
+artifacts/architecture_search/feature_change_action_conditioned_initial/combined_leaderboard.json
+```
+
+Initial best-by-dataset results:
+
+| dataset | best model | type | val regret | val MSE | test regret | test MSE |
+| --- | --- | --- | --- | --- | --- | --- |
+| `dexed_real` | `cnn-small-s7` | `cnn1d` | `0.159846` | `0.0102375` | `0.123465` | `0.0104374` |
+| `ultra_real` | `lstm-small-s7` | `lstm` | `0.07357` | `0.000388206` | `0.0684737` | `0.000479126` |
+
+Interpret these as short CPU sanity results, not final model selection. The current artifact dataset format stores per-action rewards, not per-action next embeddings, so `search-feature-change-models` predicts immediate reward/distance improvement as the available feature-change proxy.
 
 ## DQN Agent Path
 
