@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 from pathlib import Path
 from time import perf_counter
 from typing import Any
 
 import numpy as np
 
-from .logging_utils import create_summary_writer, make_progress_bar, stage_log
+from .logging_utils import make_progress_bar, stage_log
 from .manifest import append_csv, write_json
 from .networks import build_network
 from .optional_deps import require_dependency
@@ -33,6 +34,9 @@ def load_sweep_config(path: Path) -> dict[str, Any]:
         "val": float(split.get("val", 0.1)) / total,
         "test": float(split.get("test", 0.1)) / total,
     }
+    cv_folds = int(payload.get("cv_folds", 1) or 1)
+    assert cv_folds >= 1, "cv_folds must be an integer >= 1."
+    payload["cv_folds"] = cv_folds
     return payload
 
 
@@ -105,6 +109,57 @@ def _split_indices(
     if result["test"].size == 0:
         result["test"] = result["val"]
     return result
+
+
+def _cross_validation_splits(
+    row_count: int,
+    folds: int,
+    seed: int,
+    *,
+    group_ids: np.ndarray | None = None,
+) -> list[dict[str, np.ndarray]]:
+    assert folds >= 2, "Cross validation requires cv_folds >= 2."
+    rng = np.random.default_rng(seed)
+    if group_ids is not None:
+        units = rng.permutation(np.unique(group_ids))
+        assert folds <= units.shape[0], (
+            f"cv_folds={folds} requires at least {folds} source groups, found {units.shape[0]}."
+        )
+        fold_units = np.array_split(units, folds)
+        splits = []
+        for fold_index in range(folds):
+            test_groups = fold_units[fold_index]
+            val_groups = fold_units[(fold_index + 1) % folds]
+            train_parts = [
+                fold_units[index] for index in range(folds) if index not in {fold_index, (fold_index + 1) % folds}
+            ]
+            train_groups = np.concatenate(train_parts) if train_parts else np.asarray([], dtype=units.dtype)
+            if train_groups.size == 0:
+                train_groups = np.concatenate([fold_units[index] for index in range(folds) if index != fold_index])
+            splits.append(
+                {
+                    "train": np.flatnonzero(np.isin(group_ids, train_groups)),
+                    "val": np.flatnonzero(np.isin(group_ids, val_groups)),
+                    "test": np.flatnonzero(np.isin(group_ids, test_groups)),
+                }
+            )
+        return splits
+
+    units = rng.permutation(row_count)
+    assert folds <= units.shape[0], f"cv_folds={folds} requires at least {folds} rows, found {units.shape[0]}."
+    fold_units = np.array_split(units, folds)
+    splits = []
+    for fold_index in range(folds):
+        test_indices = fold_units[fold_index]
+        val_indices = fold_units[(fold_index + 1) % folds]
+        train_parts = [
+            fold_units[index] for index in range(folds) if index not in {fold_index, (fold_index + 1) % folds}
+        ]
+        train_indices = np.concatenate(train_parts) if train_parts else np.asarray([], dtype=units.dtype)
+        if train_indices.size == 0:
+            train_indices = np.concatenate([fold_units[index] for index in range(folds) if index != fold_index])
+        splits.append({"train": train_indices, "val": val_indices, "test": test_indices})
+    return splits
 
 
 def _action_features(action_count: int, param_count: int, action_step: float) -> np.ndarray:
@@ -182,6 +237,68 @@ def _batch_ranges(count: int, batch_size: int):
         yield start, min(start + batch_size, count)
 
 
+def _metrics_from_predictions(
+    pred: np.ndarray,
+    true: np.ndarray,
+    *,
+    group_ids: np.ndarray | None = None,
+    action_ids: np.ndarray | None = None,
+) -> dict[str, float]:
+    pred = np.asarray(pred, dtype=np.float32)
+    true = np.asarray(true, dtype=np.float32)
+    errors = pred - true
+    result = {
+        "mse": float(np.mean(np.square(errors))),
+        "mae": float(np.mean(np.abs(errors))),
+        "sign_accuracy": float(np.mean(np.sign(pred) == np.sign(true))),
+    }
+    if true.shape[1] > 1:
+        true_best = np.argmax(true, axis=1)
+        pred_best = np.argmax(pred, axis=1)
+        top_k = min(5, true.shape[1])
+        pred_top_k = np.argsort(pred, axis=1)[:, -top_k:]
+        chosen_true_reward = true[np.arange(true.shape[0]), pred_best]
+        best_true_reward = true[np.arange(true.shape[0]), true_best]
+        result.update(
+            {
+                "top1_accuracy": float(np.mean(pred_best == true_best)),
+                "top5_accuracy": float(np.mean([true_best[index] in pred_top_k[index] for index in range(true.shape[0])])),
+                "mean_regret": float(np.mean(best_true_reward - chosen_true_reward)),
+            }
+        )
+        return result
+    if group_ids is not None and action_ids is not None:
+        pred_values = pred.reshape(-1)
+        true_values = true.reshape(-1)
+        top1_hits = []
+        top5_hits = []
+        regrets = []
+        for group in np.unique(group_ids):
+            mask = group_ids == group
+            group_true = true_values[mask]
+            group_pred = pred_values[mask]
+            group_actions = action_ids[mask]
+            true_best_index = int(np.argmax(group_true))
+            pred_best_index = int(np.argmax(group_pred))
+            true_best_action = int(group_actions[true_best_index])
+            pred_best_action = int(group_actions[pred_best_index])
+            top_k = min(5, group_pred.shape[0])
+            pred_top_actions = set(int(group_actions[index]) for index in np.argsort(group_pred)[-top_k:])
+            top1_hits.append(pred_best_action == true_best_action)
+            top5_hits.append(true_best_action in pred_top_actions)
+            regrets.append(float(group_true[true_best_index] - group_true[pred_best_index]))
+        result.update(
+            {
+                "top1_accuracy": float(np.mean(top1_hits)) if top1_hits else 0.0,
+                "top5_accuracy": float(np.mean(top5_hits)) if top5_hits else 0.0,
+                "mean_regret": float(np.mean(regrets)) if regrets else 0.0,
+            }
+        )
+    else:
+        result.update({"top1_accuracy": 0.0, "top5_accuracy": 0.0, "mean_regret": 0.0})
+    return result
+
+
 def _evaluate(
     torch,
     network,
@@ -205,59 +322,191 @@ def _evaluate(
             targets.append(target.detach().cpu().numpy())
     pred = np.concatenate(predictions, axis=0)
     true = np.concatenate(targets, axis=0)
-    errors = pred - true
-    result = {
-        "mse": float(np.mean(np.square(errors))),
-        "mae": float(np.mean(np.abs(errors))),
-        "sign_accuracy": float(np.mean(np.sign(pred) == np.sign(true))),
+    selected_group_ids = group_ids[indices] if group_ids is not None else None
+    selected_action_ids = action_ids[indices] if action_ids is not None else None
+    return _metrics_from_predictions(pred, true, group_ids=selected_group_ids, action_ids=selected_action_ids)
+
+
+def _make_dataloader(torch, observations, rewards, indices: np.ndarray, spec: dict[str, Any], *, shuffle: bool):
+    batch_size = int(spec["batch_size"])
+    dataset = torch.utils.data.TensorDataset(
+        observations[indices],
+        rewards[indices],
+        torch.tensor(indices, dtype=torch.long),
+    )
+    generator = torch.Generator()
+    generator.manual_seed(int(spec["seed"]))
+    return torch.utils.data.DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=int(spec.get("num_workers", 0)),
+        pin_memory=bool(spec.get("pin_memory", False)),
+        generator=generator if shuffle else None,
+    )
+
+
+def _tensorboard_hparams(spec: dict[str, Any], *, cv_folds: int = 1, fold: int | None = None) -> dict[str, Any]:
+    hparams: dict[str, Any] = {}
+    for key, value in spec.items():
+        if isinstance(value, (str, int, float, bool)):
+            hparams[key] = value
+        elif isinstance(value, list):
+            hparams[key] = ",".join(str(item) for item in value)
+        elif value is not None:
+            hparams[key] = str(value)
+    hparams["cv_folds"] = int(cv_folds)
+    if fold is not None:
+        hparams["fold"] = int(fold)
+    return hparams
+
+
+def _tensorboard_hp_metrics(metrics: dict[str, Any]) -> dict[str, float]:
+    val_mse = float(metrics["val"]["mse"])
+    val_mean_regret = float(metrics["val"]["mean_regret"])
+    return {
+        "hp_metric": val_mean_regret,
+        "hp/val_mse": val_mse,
+        "hp/val_mean_regret": val_mean_regret,
+        "hp/val_top1_accuracy": float(metrics["val"]["top1_accuracy"]),
+        "hp/test_mse": float(metrics["test"]["mse"]),
+        "hp/test_mean_regret": float(metrics["test"]["mean_regret"]),
     }
-    if true.shape[1] > 1:
-        true_best = np.argmax(true, axis=1)
-        pred_best = np.argmax(pred, axis=1)
-        top_k = min(5, true.shape[1])
-        pred_top_k = np.argsort(pred, axis=1)[:, -top_k:]
-        chosen_true_reward = true[np.arange(true.shape[0]), pred_best]
-        best_true_reward = true[np.arange(true.shape[0]), true_best]
-        result.update(
-            {
-                "top1_accuracy": float(np.mean(pred_best == true_best)),
-                "top5_accuracy": float(np.mean([true_best[index] in pred_top_k[index] for index in range(true.shape[0])])),
-                "mean_regret": float(np.mean(best_true_reward - chosen_true_reward)),
-            }
-        )
-        return result
-    if group_ids is not None and action_ids is not None:
-        selected_groups = group_ids[indices]
-        selected_actions = action_ids[indices]
-        pred_values = pred.reshape(-1)
-        true_values = true.reshape(-1)
-        top1_hits = []
-        top5_hits = []
-        regrets = []
-        for group in np.unique(selected_groups):
-            mask = selected_groups == group
-            group_true = true_values[mask]
-            group_pred = pred_values[mask]
-            group_actions = selected_actions[mask]
-            true_best_index = int(np.argmax(group_true))
-            pred_best_index = int(np.argmax(group_pred))
-            true_best_action = int(group_actions[true_best_index])
-            pred_best_action = int(group_actions[pred_best_index])
-            top_k = min(5, group_pred.shape[0])
-            pred_top_actions = set(int(group_actions[index]) for index in np.argsort(group_pred)[-top_k:])
-            top1_hits.append(pred_best_action == true_best_action)
-            top5_hits.append(true_best_action in pred_top_actions)
-            regrets.append(float(group_true[true_best_index] - group_true[pred_best_index]))
-        result.update(
-            {
-                "top1_accuracy": float(np.mean(top1_hits)) if top1_hits else 0.0,
-                "top5_accuracy": float(np.mean(top5_hits)) if top5_hits else 0.0,
-                "mean_regret": float(np.mean(regrets)) if regrets else 0.0,
-            }
-        )
-    else:
-        result.update({"top1_accuracy": 0.0, "top5_accuracy": 0.0, "mean_regret": 0.0})
-    return result
+
+
+def _log_tensorboard_hparams(logger: Any, spec: dict[str, Any], metrics: dict[str, Any], *, cv_folds: int = 1, fold: int | None = None) -> None:
+    if not logger:
+        return
+    logger.log_hyperparams(
+        _tensorboard_hparams(spec, cv_folds=cv_folds, fold=fold),
+        _tensorboard_hp_metrics(metrics),
+    )
+    if hasattr(logger, "save"):
+        logger.save()
+
+
+def _lightning_module_class(lightning, torch):
+    class _SupervisedActionValueModule(lightning.LightningModule):
+        def __init__(
+            self,
+            network,
+            *,
+            learning_rate: float,
+            weight_decay: float,
+            group_ids: np.ndarray | None,
+            action_ids: np.ndarray | None,
+        ):
+            super().__init__()
+            self.network = network
+            self.learning_rate = float(learning_rate)
+            self.weight_decay = float(weight_decay)
+            self.loss_fn = torch.nn.MSELoss()
+            self.group_ids = group_ids
+            self.action_ids = action_ids
+            self.loss_rows: list[dict[str, float | int]] = []
+            self._train_losses = []
+            self._val_predictions = []
+            self._val_targets = []
+            self._val_indices = []
+            self._test_predictions = []
+            self._test_targets = []
+            self._test_indices = []
+            self.save_hyperparameters(ignore=["network", "group_ids", "action_ids"])
+
+        def forward(self, observation):
+            return self.network(observation)
+
+        def on_train_epoch_start(self):
+            self._train_losses = []
+
+        def training_step(self, batch, batch_idx):
+            observations, rewards, _indices = batch
+            predictions = self(observations)
+            loss = self.loss_fn(predictions, rewards)
+            self._train_losses.append(loss.detach())
+            self.log("train_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
+            return loss
+
+        def on_train_epoch_end(self):
+            if self._train_losses:
+                train_loss = torch.stack(self._train_losses).mean().detach().cpu()
+                row = {"epoch": int(self.current_epoch + 1), "train_loss": float(train_loss.item())}
+                self.loss_rows.append(row)
+
+        def on_validation_epoch_start(self):
+            self._val_predictions = []
+            self._val_targets = []
+            self._val_indices = []
+
+        def validation_step(self, batch, batch_idx):
+            observations, rewards, indices = batch
+            predictions = self(observations)
+            loss = self.loss_fn(predictions, rewards)
+            self._val_predictions.append(predictions.detach().cpu())
+            self._val_targets.append(rewards.detach().cpu())
+            self._val_indices.append(indices.detach().cpu())
+            self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
+            return loss
+
+        def on_validation_epoch_end(self):
+            if not self._val_predictions:
+                return
+            pred = torch.cat(self._val_predictions, dim=0).numpy()
+            true = torch.cat(self._val_targets, dim=0).numpy()
+            indices = torch.cat(self._val_indices, dim=0).numpy()
+            selected_group_ids = self.group_ids[indices] if self.group_ids is not None else None
+            selected_action_ids = self.action_ids[indices] if self.action_ids is not None else None
+            metrics = _metrics_from_predictions(
+                pred,
+                true,
+                group_ids=selected_group_ids,
+                action_ids=selected_action_ids,
+            )
+            for key, value in metrics.items():
+                self.log(f"val_{key}", float(value), on_step=False, on_epoch=True, prog_bar=key in {"mse", "mean_regret"})
+            if self.loss_rows:
+                self.loss_rows[-1].update({f"val_{key}": float(value) for key, value in metrics.items()})
+
+        def on_test_epoch_start(self):
+            self._test_predictions = []
+            self._test_targets = []
+            self._test_indices = []
+
+        def test_step(self, batch, batch_idx):
+            observations, rewards, indices = batch
+            predictions = self(observations)
+            loss = self.loss_fn(predictions, rewards)
+            self._test_predictions.append(predictions.detach().cpu())
+            self._test_targets.append(rewards.detach().cpu())
+            self._test_indices.append(indices.detach().cpu())
+            self.log("test_loss", loss, on_step=False, on_epoch=True)
+            return loss
+
+        def on_test_epoch_end(self):
+            if not self._test_predictions:
+                return
+            pred = torch.cat(self._test_predictions, dim=0).numpy()
+            true = torch.cat(self._test_targets, dim=0).numpy()
+            indices = torch.cat(self._test_indices, dim=0).numpy()
+            selected_group_ids = self.group_ids[indices] if self.group_ids is not None else None
+            selected_action_ids = self.action_ids[indices] if self.action_ids is not None else None
+            metrics = _metrics_from_predictions(
+                pred,
+                true,
+                group_ids=selected_group_ids,
+                action_ids=selected_action_ids,
+            )
+            for key, value in metrics.items():
+                self.log(f"test_{key}", float(value), on_step=False, on_epoch=True)
+
+        def configure_optimizers(self):
+            return torch.optim.Adam(
+                self.network.parameters(),
+                lr=self.learning_rate,
+                weight_decay=self.weight_decay,
+            )
+
+    return _SupervisedActionValueModule
 
 
 def _train_one(
@@ -272,9 +521,14 @@ def _train_one(
     out_dir: Path,
     progress: bool,
     tensorboard: bool,
+    arch_dir: Path | None = None,
+    cv_folds: int = 1,
+    fold_index: int | None = None,
 ) -> dict[str, Any]:
     torch = require_dependency("torch", "ml")
-    torch.manual_seed(int(spec["seed"]))
+    lightning = require_dependency("lightning.pytorch", "ml")
+    TensorBoardLogger = require_dependency("lightning.pytorch.loggers", "ml").TensorBoardLogger
+    lightning.seed_everything(int(spec["seed"]), workers=True)
     observations = torch.tensor(observations_np, dtype=torch.float32)
     rewards = torch.tensor(rewards_np, dtype=torch.float32)
     observation_size = int(observations_np.shape[1])
@@ -286,53 +540,37 @@ def _train_one(
         param_count=metadata.get("param_count"),
         embedding_size=metadata.get("embedding_size"),
     )
-    optimizer = torch.optim.Adam(
-        network.parameters(),
-        lr=float(spec["learning_rate"]),
-        weight_decay=float(spec.get("weight_decay", 0.0)),
-    )
-    loss_fn = torch.nn.MSELoss()
     batch_size = int(spec["batch_size"])
-    epochs = int(spec["epochs"])
-    arch_dir = out_dir / _slugify(str(spec["name"]))
+    arch_dir = arch_dir or out_dir / _slugify(str(spec["name"]))
     arch_dir.mkdir(parents=True, exist_ok=True)
-    writer = create_summary_writer(tensorboard, arch_dir / "tensorboard")
-    losses: list[dict[str, float | int | str]] = []
+    train_loader = _make_dataloader(torch, observations, rewards, split_indices["train"], spec, shuffle=True)
+    val_loader = _make_dataloader(torch, observations, rewards, split_indices["val"], spec, shuffle=False)
+    test_loader = _make_dataloader(torch, observations, rewards, split_indices["test"], spec, shuffle=False)
+    module_class = _lightning_module_class(lightning, torch)
+    module = module_class(
+        network,
+        learning_rate=float(spec["learning_rate"]),
+        weight_decay=float(spec.get("weight_decay", 0.0)),
+        group_ids=group_ids,
+        action_ids=action_ids,
+    )
+    logger = TensorBoardLogger(save_dir=str(arch_dir), name="tensorboard", version="") if tensorboard else False
+    trainer = lightning.Trainer(
+        max_epochs=int(spec["epochs"]),
+        enable_progress_bar=progress,
+        logger=logger,
+        enable_checkpointing=False,
+        accelerator=str(spec.get("accelerator", "auto")),
+        devices=spec.get("devices", "auto"),
+        deterministic=True,
+        num_sanity_val_steps=0,
+        enable_model_summary=progress,
+        log_every_n_steps=1,
+    )
     started = perf_counter()
-    progress_bar = make_progress_bar(total=epochs, desc=f"train {spec['name']}", enabled=progress)
-    train_indices = split_indices["train"]
-    rng = np.random.default_rng(int(spec["seed"]))
-    for epoch in range(1, epochs + 1):
-        network.train()
-        epoch_indices = rng.permutation(train_indices)
-        batch_losses: list[float] = []
-        for start, stop in _batch_ranges(len(epoch_indices), batch_size):
-            batch_idx = epoch_indices[start:stop]
-            prediction = network(observations[batch_idx])
-            loss = loss_fn(prediction, rewards[batch_idx])
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            batch_losses.append(float(loss.item()))
-        train_loss = float(np.mean(batch_losses)) if batch_losses else float("nan")
-        val_metrics = _evaluate(
-            torch,
-            network,
-            observations,
-            rewards,
-            split_indices["val"],
-            batch_size,
-            group_ids=group_ids,
-            action_ids=action_ids,
-        )
-        row = {"epoch": epoch, "train_loss": train_loss, **{f"val_{k}": v for k, v in val_metrics.items()}}
-        losses.append(row)
-        writer.add_scalar("loss/train", train_loss, epoch)
-        writer.add_scalar("loss/val_mse", val_metrics["mse"], epoch)
-        writer.add_scalar("metrics/val_regret", val_metrics["mean_regret"], epoch)
-        progress_bar.set_postfix({"loss": f"{train_loss:.4f}", "regret": f"{val_metrics['mean_regret']:.4f}"})
-        progress_bar.update(1)
-    progress_bar.close()
+    trainer.fit(module, train_dataloaders=train_loader, val_dataloaders=val_loader)
+    trainer.test(module, dataloaders=test_loader, verbose=False)
+    losses = list(module.loss_rows)
     metrics = {
         "name": str(spec["name"]),
         "type": str(spec["type"]),
@@ -369,12 +607,77 @@ def _train_one(
         ),
         "checkpoint": str(arch_dir / "checkpoint.pt"),
     }
+    _log_tensorboard_hparams(
+        trainer.logger,
+        spec,
+        metrics,
+        cv_folds=cv_folds,
+        fold=fold_index,
+    )
     torch.save({"state_dict": network.state_dict(), "spec": spec, "metadata": metadata}, arch_dir / "checkpoint.pt")
     write_json(arch_dir / "metrics.json", metrics)
     write_json(arch_dir / "resolved_config.json", spec)
     append_csv(arch_dir / "loss.csv", list(losses[0].keys()) if losses else [], losses)
-    writer.flush()
-    writer.close()
+    return metrics
+
+
+def _aggregate_cross_validation_metrics(
+    spec: dict[str, Any],
+    fold_metrics: list[dict[str, Any]],
+    *,
+    arch_dir: Path,
+    tensorboard: bool,
+) -> dict[str, Any]:
+    assert fold_metrics, "Cannot aggregate cross-validation metrics without folds."
+    arch_dir.mkdir(parents=True, exist_ok=True)
+    metrics: dict[str, Any] = {
+        "name": str(spec["name"]),
+        "type": str(spec["type"]),
+        "cv_folds": len(fold_metrics),
+        "training_seconds": float(sum(float(item.get("training_seconds", 0.0)) for item in fold_metrics)),
+        "folds": fold_metrics,
+        "checkpoint": str(arch_dir / "checkpoint.pt"),
+    }
+    for split_name in ("train", "val", "test"):
+        metric_names = sorted(
+            {
+                metric_name
+                for fold in fold_metrics
+                for metric_name in fold.get(split_name, {}).keys()
+            }
+        )
+        metrics[split_name] = {}
+        for metric_name in metric_names:
+            values = np.asarray([float(fold[split_name][metric_name]) for fold in fold_metrics], dtype=np.float64)
+            metrics[split_name][metric_name] = float(values.mean())
+            metrics[split_name][f"{metric_name}_std"] = float(values.std(ddof=0))
+
+    final_fold_checkpoint = Path(str(fold_metrics[-1]["checkpoint"]))
+    if final_fold_checkpoint.exists():
+        shutil.copyfile(final_fold_checkpoint, arch_dir / "checkpoint.pt")
+    write_json(arch_dir / "metrics.json", metrics)
+    write_json(arch_dir / "resolved_config.json", spec)
+
+    loss_rows: list[dict[str, Any]] = []
+    for fold_index in range(len(fold_metrics)):
+        loss_path = arch_dir / f"fold-{fold_index:02d}" / "loss.csv"
+        if not loss_path.exists():
+            continue
+        lines = loss_path.read_text().strip().splitlines()
+        if len(lines) < 2:
+            continue
+        headers = lines[0].split(",")
+        for line in lines[1:]:
+            values = line.split(",")
+            row = {"fold": fold_index}
+            row.update({header: values[index] for index, header in enumerate(headers) if index < len(values)})
+            loss_rows.append(row)
+    if loss_rows:
+        append_csv(arch_dir / "loss.csv", list(loss_rows[0].keys()), loss_rows)
+    if tensorboard:
+        lightning_loggers = require_dependency("lightning.pytorch.loggers", "ml")
+        logger = lightning_loggers.TensorBoardLogger(save_dir=str(arch_dir), name="tensorboard", version="cv-summary")
+        _log_tensorboard_hparams(logger, spec, metrics, cv_folds=len(fold_metrics))
     return metrics
 
 
@@ -397,36 +700,74 @@ def compare_architectures(
     observations, rewards, metadata, group_ids, action_ids = _prepare_supervised_arrays(dataset, metadata, config)
     out_dir.mkdir(parents=True, exist_ok=True)
     write_json(out_dir / "sweep_config.json", config)
+    cv_folds = int(config.get("cv_folds", 1) or 1)
     split_indices = _split_indices(
         observations.shape[0],
         config["split"],
         int(config.get("seed", 7)),
         group_ids=group_ids,
     )
+    cv_splits = (
+        _cross_validation_splits(
+            observations.shape[0],
+            cv_folds,
+            int(config.get("seed", 7)),
+            group_ids=group_ids,
+        )
+        if cv_folds > 1
+        else [split_indices]
+    )
     stage_log(
         f"Comparing {len(config['architectures'])} architecture(s). "
-        f"Rows={observations.shape[0]} obs={observations.shape[1]} actions={rewards.shape[1]}."
+        f"Rows={observations.shape[0]} obs={observations.shape[1]} actions={rewards.shape[1]} cv_folds={cv_folds}."
     )
     leaderboard: list[dict[str, Any]] = []
     arch_progress = make_progress_bar(total=len(config["architectures"]), desc="architectures", enabled=progress)
     for spec in config["architectures"]:
         stage_log(f"Training architecture '{spec['name']}' ({spec['type']}).")
-        metrics = _train_one(
-            spec,
-            observations_np=observations,
-            rewards_np=rewards,
-            split_indices=split_indices,
-            metadata=metadata,
-            group_ids=group_ids,
-            action_ids=action_ids,
-            out_dir=out_dir,
-            progress=progress,
-            tensorboard=tensorboard,
-        )
+        arch_dir = out_dir / _slugify(str(spec["name"]))
+        if cv_folds > 1:
+            fold_metrics = []
+            for fold_index, fold_split_indices in enumerate(cv_splits):
+                stage_log(f"Training fold {fold_index + 1}/{cv_folds} for architecture '{spec['name']}'.")
+                fold_metrics.append(
+                    _train_one(
+                        spec,
+                        observations_np=observations,
+                        rewards_np=rewards,
+                        split_indices=fold_split_indices,
+                        metadata=metadata,
+                        group_ids=group_ids,
+                        action_ids=action_ids,
+                        out_dir=out_dir,
+                        progress=progress,
+                        tensorboard=tensorboard,
+                        arch_dir=arch_dir / f"fold-{fold_index:02d}",
+                        cv_folds=cv_folds,
+                        fold_index=fold_index,
+                    )
+                )
+            metrics = _aggregate_cross_validation_metrics(spec, fold_metrics, arch_dir=arch_dir, tensorboard=tensorboard)
+        else:
+            metrics = _train_one(
+                spec,
+                observations_np=observations,
+                rewards_np=rewards,
+                split_indices=split_indices,
+                metadata=metadata,
+                group_ids=group_ids,
+                action_ids=action_ids,
+                out_dir=out_dir,
+                progress=progress,
+                tensorboard=tensorboard,
+                arch_dir=arch_dir,
+                cv_folds=cv_folds,
+            )
         leaderboard.append(
             {
                 "name": metrics["name"],
                 "type": metrics["type"],
+                "cv_folds": metrics.get("cv_folds", 1),
                 "val_mse": metrics["val"]["mse"],
                 "val_mae": metrics["val"]["mae"],
                 "val_top1_accuracy": metrics["val"]["top1_accuracy"],
@@ -446,6 +787,7 @@ def compare_architectures(
         "config_path": str(config_path),
         "row_count": int(observations.shape[0]),
         "action_count": int(rewards.shape[1]),
+        "cv_folds": cv_folds,
         "leaderboard": leaderboard,
         "best": leaderboard[0] if leaderboard else None,
     }

@@ -197,7 +197,9 @@ If the config contains `"target": "action_reward_as_feature_change_proxy"`, it e
 [observation, parameter_index_normalized, signed_delta] -> immediate_reward
 ```
 
-This mode preserves grouped train/val/test splits by original source row to avoid leaking actions from the same state across splits. By default the generated hypersearch config also excludes rows with failed action renders.
+This mode preserves grouped train/val/test splits by original source row to avoid leaking actions from the same state across splits. Set `"cv_folds": 2` or higher in the sweep config, or pass `--cv-folds` to `search-feature-change-models` when using the generated config, to run grouped cross-validation. Use `3` or higher when you want distinct train/validation/test fold roles. By default the generated hypersearch config excludes rows with failed action renders and leaves cross-validation disabled.
+
+Architecture training is Lightning-backed. The repo still owns the search loop and artifact schema, while Lightning owns per-trial train/validation/test execution, deterministic seeding, progress, and TensorBoard logging. With `--tensorboard`, per-epoch metrics and TensorBoard HParams summaries are written below each architecture directory; point TensorBoard at the sweep root to compare trials.
 
 `search-feature-change-models` wraps this for public experiments. It discovers all `*/action_dataset/dataset.npz` files under `artifacts/`, writes a generated CNN/RNN-heavy `search_config.json`, runs each dataset, and emits:
 
@@ -222,7 +224,7 @@ Headline results from that run:
 - `dexed_real`: `cnn-small-s7`, validation regret `0.159846`, validation MSE `0.0102375`
 - `ultra_real`: `lstm-small-s7`, validation regret `0.07357`, validation MSE `0.000388206`
 
-For a longer GPU-server rerun, increase `--epochs`, optionally remove or raise `max_expanded_rows` in the generated config, and consider enabling `--tensorboard`.
+For a longer GPU-server rerun, increase `--epochs`, optionally remove or raise `max_expanded_rows` in the generated config, consider `--cv-folds 3`, and enable `--tensorboard`.
 
 ## CLI and Artifacts
 

@@ -124,6 +124,7 @@ class CliLoggingOptionsTest(unittest.TestCase):
         self.assertIsNone(args.config)
         self.assertEqual(args.out_dir, "architecture_search/feature_change")
         self.assertEqual(args.epochs, 5)
+        self.assertEqual(args.cv_folds, 1)
         self.assertTrue(args.progress)
         self.assertFalse(args.tensorboard)
 

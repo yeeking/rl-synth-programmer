@@ -7,7 +7,12 @@ from .architecture_sweep import compare_architectures
 from .manifest import append_csv, write_json
 
 
-def default_feature_change_search_config(*, epochs: int = 5, seeds: tuple[int, ...] = (7, 11)) -> dict[str, Any]:
+def default_feature_change_search_config(
+    *,
+    epochs: int = 5,
+    seeds: tuple[int, ...] = (7, 11),
+    cv_folds: int = 1,
+) -> dict[str, Any]:
     """Return a small CNN/RNN-heavy sweep config for offline action-reward prediction."""
     architectures: list[dict[str, Any]] = []
     for seed in seeds:
@@ -95,6 +100,7 @@ def default_feature_change_search_config(*, epochs: int = 5, seeds: tuple[int, .
         )
     return {
         "seed": 7,
+        "cv_folds": int(cv_folds),
         "split": {"train": 0.7, "val": 0.15, "test": 0.15},
         "target": "action_reward_as_feature_change_proxy",
         "exclude_failed_rows": True,

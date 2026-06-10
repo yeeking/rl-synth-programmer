@@ -398,6 +398,12 @@ def _base_parser() -> argparse.ArgumentParser:
         help="Epochs for the generated default config. Ignored when --config is provided. Default: 5.",
     )
     search_parser.add_argument(
+        "--cv-folds",
+        type=int,
+        default=1,
+        help="Grouped cross-validation folds for the generated default config. Use 1 to disable. Ignored when --config is provided. Default: 1.",
+    )
+    search_parser.add_argument(
         "--progress",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -807,6 +813,8 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
     elif args.command == "search-feature-change-models":
         if not _is_positive_int(args.epochs):
             _argument_error(parser, "--epochs must be an integer >= 1.")
+        if not _is_positive_int(args.cv_folds):
+            _argument_error(parser, "--cv-folds must be an integer >= 1.")
         if args.config is not None:
             _require_existing_file(parser, "--config", args.config)
         if args.dataset:
@@ -1073,6 +1081,7 @@ def _cmd_search_feature_change_models(
     config_path: str | None,
     out_dir: str,
     epochs: int,
+    cv_folds: int,
     progress: bool,
     tensorboard: bool,
 ) -> None:
@@ -1083,7 +1092,7 @@ def _cmd_search_feature_change_models(
     if config_path is not None:
         config = json.loads(Path(config_path).read_text())
     else:
-        config = default_feature_change_search_config(epochs=epochs)
+        config = default_feature_change_search_config(epochs=epochs, cv_folds=cv_folds)
     result = run_feature_change_search(
         datasets,
         _resolve_run_folder(out_dir, create=True),
@@ -1181,6 +1190,7 @@ def main() -> None:
                 args.config,
                 args.out_dir,
                 args.epochs,
+                args.cv_folds,
                 args.progress,
                 args.tensorboard,
             )

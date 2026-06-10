@@ -88,7 +88,8 @@ Run the default CNN/RNN-focused action-conditioned search across every discovere
 rl-synth search-feature-change-models \
   --artifacts-root artifacts \
   --out-dir artifacts/architecture_search/feature_change \
-  --epochs 5
+  --epochs 5 \
+  --tensorboard
 ```
 
 Train the online DQN agent:
@@ -123,7 +124,7 @@ rl-synth compare-architectures --dataset "$RUN_FOLDER/action_dataset/dataset.npz
 rl-synth random-agent --plugin "$SYNTH_PLUGIN" --run-folder "$RUN_FOLDER" --episodes 4
 rl-synth train-dqn --plugin "$SYNTH_PLUGIN" --run-folder "$RUN_FOLDER" --reward-mode clap --steps 2000
 rl-synth evaluate --plugin "$SYNTH_PLUGIN" --run-folder "$RUN_FOLDER" --episodes 8
-rl-synth search-feature-change-models --artifacts-root artifacts --out-dir artifacts/architecture_search/feature_change --epochs 5
+rl-synth search-feature-change-models --artifacts-root artifacts --out-dir artifacts/architecture_search/feature_change --epochs 5 --cv-folds 1
 rl-synth full-smoke --plugin "$SYNTH_PLUGIN" --run-folder artifacts/full_smoke
 ```
 
@@ -155,6 +156,7 @@ Example `sweep.json`:
 ```json
 {
   "split": {"train": 0.8, "val": 0.1, "test": 0.1},
+  "cv_folds": 1,
   "architectures": [
     {
       "name": "mlp-512-256",
@@ -182,7 +184,9 @@ Example `sweep.json`:
 }
 ```
 
-Supported architecture types are `mlp`, `residual_mlp`, `cnn1d`, `hybrid_cnn_mlp`, `rnn`, `gru`, and `lstm`. The sweep writes per-architecture checkpoints and metrics plus `leaderboard.json` and `leaderboard.csv`.
+Supported architecture types are `mlp`, `residual_mlp`, `cnn1d`, `hybrid_cnn_mlp`, `rnn`, `gru`, and `lstm`. The sweep trains with PyTorch Lightning, writes per-architecture checkpoints and metrics plus `leaderboard.json` and `leaderboard.csv`, and keeps the existing checkpoint/leaderboard schema stable.
+
+Set `"cv_folds": 2` or higher in a sweep config to enable grouped cross-validation; `3` or higher gives distinct train/validation/test fold roles. In action-conditioned mode, folds are assigned by original source state so individual actions from the same state do not leak across train/validation/test partitions. The aggregate architecture directory keeps `metrics.json`, `loss.csv`, and `checkpoint.pt`; per-fold artifacts live under `fold-00/`, `fold-01/`, and so on.
 
 `search-feature-change-models` generates a compact CNN/RNN-heavy config and runs it across all discovered `*/action_dataset/dataset.npz` files. It uses the stored immediate reward as a feature-change proxy because the current dataset format stores all-action rewards but not per-action next embeddings. The action-conditioned input is:
 
@@ -198,7 +202,13 @@ The combined results are written to:
 <out-dir>/combined_leaderboard.json
 ```
 
-For a longer GPU-server rerun, increase `--epochs`, remove or raise `max_expanded_rows` in the generated `search_config.json`, and optionally enable `--tensorboard`.
+For a longer GPU-server rerun, increase `--epochs`, remove or raise `max_expanded_rows` in the generated `search_config.json`, add `--cv-folds 3` when you want grouped cross-validation in the generated config, and optionally enable `--tensorboard`.
+
+TensorBoard logs live under each architecture directory when `--tensorboard` is enabled. Open TensorBoard at the sweep root to inspect scalar curves and the HParams summary table:
+
+```bash
+tensorboard --logdir artifacts/architecture_search/feature_change
+```
 
 ### Latest Initial Search
 
