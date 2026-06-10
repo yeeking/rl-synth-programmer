@@ -667,6 +667,10 @@ def _resolve_run_folder(run_folder: str | Path | None, *, default_name: str | No
     return resolved
 
 
+def _display_run_folder(run_folder: str | Path | None, *, default_name: str | None = None) -> Path:
+    return _resolve_run_folder(run_folder, default_name=default_name, create=True)
+
+
 def _resolve_tensorboard_dir(run_folder: Path, command_name: str, tensorboard_dir: str | None) -> Path:
     if tensorboard_dir is not None:
         return _resolve_run_folder(tensorboard_dir, create=True)
@@ -687,8 +691,7 @@ def _resolve_tensorboard_dir(run_folder: Path, command_name: str, tensorboard_di
 def _find_manifest(run_folder: Path) -> Path:
     manifest_path = run_folder / TARGETS_DIR_NAME / "manifest.json"
     assert manifest_path.exists(), (
-        f"Expected {manifest_path} but it was not found. "
-        f"Did you run generate-target-set with --run-folder {run_folder}?"
+        f"Expected {manifest_path} but it was not found."
     )
     return manifest_path
 
@@ -746,12 +749,26 @@ def _require_plugin_path(parser: argparse.ArgumentParser, plugin_path: str) -> s
     return str(path)
 
 
-def _require_existing_run_manifest(parser: argparse.ArgumentParser, run_folder: str, command: str) -> None:
+def _require_existing_run_manifest(
+    parser: argparse.ArgumentParser,
+    run_folder: str,
+    command: str,
+    *,
+    plugin_path: str | None = None,
+) -> None:
     try:
         run_root = _resolve_run_folder(run_folder, create=False)
         _find_manifest(run_root)
     except AssertionError as exc:
-        _argument_error(parser, f"{command} requires a generated target set. {exc}")
+        run_root = _display_run_folder(run_folder)
+        plugin_argument = plugin_path or "<path-to-synth.vst3>"
+        _argument_error(
+            parser,
+            f"{command} requires generated preset targets first. {exc} "
+            "Run this first:\n"
+            f"  rl-synth generate-target-set --plugin {plugin_argument} --run-folder {run_root} --subset-limit 12\n"
+            "Then re-run your command.",
+        )
 
 
 def _require_existing_checkpoint(parser: argparse.ArgumentParser, run_folder: str, command: str, *, smoke: bool = False) -> None:
@@ -869,7 +886,7 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
             _argument_error(parser, "--calibration-max-step must be > 0.")
         if float(args.calibration_max_step) < float(args.calibration_min_step):
             _argument_error(parser, "--calibration-max-step must be >= --calibration-min-step.")
-        _require_existing_run_manifest(parser, args.run_folder, "generate-action-dataset")
+        _require_existing_run_manifest(parser, args.run_folder, "generate-action-dataset", plugin_path=args.plugin)
     elif args.command == "compare-architectures":
         _require_existing_file(parser, "--dataset", args.dataset)
         _require_existing_file(parser, "--config", args.config)

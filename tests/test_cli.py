@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import sys
 import tempfile
 import unittest
@@ -189,7 +191,31 @@ class CliLoggingOptionsTest(unittest.TestCase):
         run_root = _resolve_run_folder("missing_manifest_test", create=True)
         with self.assertRaises(AssertionError) as ctx:
             _find_manifest(run_root)
-        self.assertIn("Did you run generate-target-set", str(ctx.exception))
+        self.assertIn("Expected artifacts/missing_manifest_test/targets/manifest.json", str(ctx.exception))
+
+    def test_generate_action_dataset_missing_manifest_suggests_target_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            plugin_path = Path(tmp) / "test.vst3"
+            plugin_path.mkdir()
+            parser = _base_parser()
+            args = parser.parse_args(
+                [
+                    "generate-action-dataset",
+                    "--plugin",
+                    str(plugin_path),
+                    "--run-folder",
+                    "missing_dataset_manifest_test",
+                ]
+            )
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                with self.assertRaises(SystemExit) as ctx:
+                    _validate_args(parser, args)
+            self.assertNotEqual(ctx.exception.code, 0)
+            message = stderr.getvalue()
+            self.assertIn("requires generated preset targets first", message)
+            self.assertIn(f"rl-synth generate-target-set --plugin {plugin_path}", message)
+            self.assertIn("--run-folder artifacts/missing_dataset_manifest_test", message)
 
     def test_cli_validation_rejects_missing_plugin_path(self) -> None:
         parser = _base_parser()
