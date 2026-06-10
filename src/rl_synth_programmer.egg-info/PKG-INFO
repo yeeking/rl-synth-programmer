@@ -83,6 +83,7 @@ rl-synth generate-action-dataset \
   --moves-per-start 8 \
   --num-workers 4 \
   --clap-batch-size 8 \
+  --action-step-calibration \
   --render-timeout-seconds 300 \
   --max-state-seconds 90 \
   --shard-size 16 \
@@ -105,6 +106,17 @@ rl-synth compare-architectures \
   --dataset "$RUN_FOLDER/action_dataset/dataset.npz" \
   --config "$RUN_FOLDER/sweep.json" \
   --out-dir "$RUN_FOLDER/architecture_sweep"
+```
+
+Run the default CNN/RNN-focused action-conditioned search across every discovered action dataset:
+
+```bash
+rl-synth search-feature-change-models \
+  --artifacts-root artifacts \
+  --out-dir artifacts/architecture_search/feature_change \
+  --epochs 5 \
+  --dataloader-num-workers 2 \
+  --tensorboard
 ```
 
 Train the online DQN agent:
@@ -139,6 +151,7 @@ rl-synth compare-architectures --dataset "$RUN_FOLDER/action_dataset/dataset.npz
 rl-synth random-agent --plugin "$SYNTH_PLUGIN" --run-folder "$RUN_FOLDER" --episodes 4
 rl-synth train-dqn --plugin "$SYNTH_PLUGIN" --run-folder "$RUN_FOLDER" --reward-mode clap --steps 2000
 rl-synth evaluate --plugin "$SYNTH_PLUGIN" --run-folder "$RUN_FOLDER" --episodes 8
+rl-synth search-feature-change-models --artifacts-root artifacts --out-dir artifacts/architecture_search/feature_change --epochs 5 --cv-folds 1 --dataloader-num-workers 2
 rl-synth full-smoke --plugin "$SYNTH_PLUGIN" --run-folder artifacts/full_smoke
 ```
 
@@ -146,13 +159,17 @@ rl-synth full-smoke --plugin "$SYNTH_PLUGIN" --run-folder artifacts/full_smoke
 
 ## Offline Dataset Details
 
-`generate-action-dataset` samples target/start preset pairs round-robin. It renders move 0 for each pair first, then move 1 for each pair, up to `--moves-per-start` or `--max-states`. For every sampled state, it evaluates every discrete action and stores:
+`generate-action-dataset` samples target/start preset pairs round-robin. Before rollout, it probes a few start states to calibrate per-parameter action steps by embedding-distance sensitivity. Parameters that need larger normalized movement to change the sound get larger steps; highly sensitive parameters get smaller steps. Use `--no-action-step-calibration` to keep the fixed global `--action-step` behavior.
+
+It renders move 0 for each pair first, then move 1 for each pair, up to `--moves-per-start` or `--max-states`. For every sampled state, it evaluates every discrete action and stores:
 
 - `observations`: flattened `[target_embedding, current_embedding, delta_embedding, params]`
 - `action_rewards`: immediate reward for each action
 - `current_distances`, target/start indices, move indices, best actions, and render diagnostics
 
 Long runs write recoverable shards under `<run-folder>/action_dataset/shards/` before merging the final `<run-folder>/action_dataset/dataset.npz`. Metadata and summary files are written next to the dataset.
+
+Calibration metadata includes `action_step_mode`, `action_step_by_parameter`, action-indexed `action_deltas`, and the probe summary under `action_step_calibration`. Downstream action-conditioned sweeps use `action_deltas` when present.
 
 Useful reliability options:
 
@@ -162,6 +179,7 @@ Useful reliability options:
 - `--reload-workers-every-renders`: periodically reload plugin worker processes
 - `--preset-render-slowdown-threshold`: detect sudden per-action render slowdowns
 - `--reload-workers-on-render-slowdown` / `--no-reload-workers-on-render-slowdown`: reload workers or assert on slowdown
+- `--calibration-probe-states`, `--calibration-probe-deltas`, `--calibration-reference-delta`, `--calibration-min-step`, `--calibration-max-step`: tune action-step calibration
 
 ## Architecture Sweep
 
@@ -170,6 +188,7 @@ Example `sweep.json`:
 ```json
 {
   "split": {"train": 0.8, "val": 0.1, "test": 0.1},
+  "cv_folds": 1,
   "architectures": [
     {
       "name": "mlp-512-256",
@@ -197,7 +216,65 @@ Example `sweep.json`:
 }
 ```
 
-Supported architecture types are `mlp`, `residual_mlp`, `cnn1d`, and `hybrid_cnn_mlp`. The sweep writes per-architecture checkpoints and metrics plus `leaderboard.json` and `leaderboard.csv`.
+Supported architecture types are `mlp`, `residual_mlp`, `cnn1d`, `hybrid_cnn_mlp`, `rnn`, `gru`, and `lstm`. The sweep trains with PyTorch Lightning, writes per-architecture checkpoints and metrics plus `leaderboard.json` and `leaderboard.csv`, and keeps the existing checkpoint/leaderboard schema stable.
+
+Set `"cv_folds": 2` or higher in a sweep config to enable grouped cross-validation; `3` or higher gives distinct train/validation/test fold roles. In action-conditioned mode, folds are assigned by original source state so individual actions from the same state do not leak across train/validation/test partitions. The aggregate architecture directory keeps `metrics.json`, `loss.csv`, and `checkpoint.pt`; per-fold artifacts live under `fold-00/`, `fold-01/`, and so on.
+
+`search-feature-change-models` generates a compact CNN/RNN-heavy config and runs it across all discovered `*/action_dataset/dataset.npz` files. It uses the stored immediate reward as a feature-change proxy because the current dataset format stores all-action rewards but not per-action next embeddings. The action-conditioned input is:
+
+```text
+[target_embedding, current_embedding, target-current delta, params, parameter_index_normalized, signed_delta]
+```
+
+The combined results are written to:
+
+```text
+<out-dir>/combined_leaderboard.md
+<out-dir>/combined_leaderboard.csv
+<out-dir>/combined_leaderboard.json
+```
+
+For a longer GPU-server rerun, increase `--epochs`, remove or raise `max_expanded_rows` in the generated `search_config.json`, add `--cv-folds 3` when you want grouped cross-validation in the generated config, and optionally enable `--tensorboard`.
+
+TensorBoard logs live under each architecture directory when `--tensorboard` is enabled. Open TensorBoard at the sweep root to inspect scalar curves and the HParams summary table:
+
+```bash
+tensorboard --logdir artifacts/architecture_search/feature_change
+```
+
+### Latest Initial Search
+
+The latest local action-conditioned search was run with:
+
+```bash
+.venv/bin/rl-synth search-feature-change-models \
+  --artifacts-root artifacts \
+  --out-dir artifacts/architecture_search/feature_change_action_conditioned_initial \
+  --epochs 5 \
+  --no-progress
+```
+
+It discovered:
+
+- `artifacts/dexed_real/action_dataset/dataset.npz`
+- `artifacts/ultra_real/action_dataset/dataset.npz`
+
+The combined result table is in:
+
+```text
+artifacts/architecture_search/feature_change_action_conditioned_initial/combined_leaderboard.md
+artifacts/architecture_search/feature_change_action_conditioned_initial/combined_leaderboard.csv
+artifacts/architecture_search/feature_change_action_conditioned_initial/combined_leaderboard.json
+```
+
+Initial best-by-dataset results:
+
+| dataset | best model | type | val regret | val MSE | test regret | test MSE |
+| --- | --- | --- | --- | --- | --- | --- |
+| `dexed_real` | `cnn-small-s7` | `cnn1d` | `0.159846` | `0.0102375` | `0.123465` | `0.0104374` |
+| `ultra_real` | `lstm-small-s7` | `lstm` | `0.07357` | `0.000388206` | `0.0684737` | `0.000479126` |
+
+Interpret these as short CPU sanity results, not final model selection. The current artifact dataset format stores per-action rewards, not per-action next embeddings, so `search-feature-change-models` predicts immediate reward/distance improvement as the available feature-change proxy.
 
 ## DQN Agent Path
 

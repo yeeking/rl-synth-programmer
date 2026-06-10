@@ -22,6 +22,7 @@ class RewardConfig:
     clap_version: str = "2023"
     clap_checkpoint: Path | None = None
     clap_text_model_path: Path | None = None
+    clap_device: str = "auto"
     distance_metric: str = "cosine"
 
 

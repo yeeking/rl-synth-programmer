@@ -170,6 +170,12 @@ def _base_parser() -> argparse.ArgumentParser:
         help="Maximum number of audio buffers embedded together in one CLAP batch. If omitted, it defaults to --num-workers. Expected range: integer >= 1.",
     )
     train_parser.add_argument(
+        "--clap-device",
+        choices=("auto", "cpu", "cuda"),
+        default="auto",
+        help="Device for CLAP embedding. 'auto' uses CUDA when torch reports it is available. Default: auto.",
+    )
+    train_parser.add_argument(
         "--epsilon-decay-steps",
         type=int,
         default=None,
@@ -276,6 +282,12 @@ def _base_parser() -> argparse.ArgumentParser:
         type=int,
         default=8,
         help="Maximum audio buffers embedded in one CLAP batch. Default: 8.",
+    )
+    dataset_parser.add_argument(
+        "--clap-device",
+        choices=("auto", "cpu", "cuda"),
+        default="auto",
+        help="Device for CLAP embedding. 'auto' uses CUDA when torch reports it is available. Default: auto.",
     )
     dataset_parser.add_argument(
         "--estimate-only",
@@ -943,13 +955,14 @@ def _experiment_config(
     num_workers: int = 1,
     updates_per_tick: int = 1,
     clap_batch_size: int | None = None,
+    clap_device: str = "auto",
     clap_batch_timeout_ms: int = 10,
     epsilon_decay_steps: int | None = None,
     max_episode_steps: int | None = None,
 ) -> ExperimentConfig:
     artifact_root = artifacts_dir or ARTIFACTS_ROOT / "default"
     host = SynthHostConfig(plugin_path=Path(plugin_path))
-    reward = RewardConfig(mode=reward_mode)
+    reward = RewardConfig(mode=reward_mode, clap_device=clap_device)
     env = SynthEnvConfig(
         host=host,
         reward=reward,
@@ -1019,6 +1032,7 @@ def _cmd_train_dqn(
     num_workers: int,
     updates_per_tick: int,
     clap_batch_size: int | None,
+    clap_device: str,
     epsilon_decay_steps: int | None,
     max_episode_steps: int | None,
 ) -> None:
@@ -1035,6 +1049,7 @@ def _cmd_train_dqn(
         num_workers=num_workers,
         updates_per_tick=updates_per_tick,
         clap_batch_size=clap_batch_size,
+        clap_device=clap_device,
         epsilon_decay_steps=epsilon_decay_steps,
         max_episode_steps=max_episode_steps,
     )
@@ -1100,6 +1115,7 @@ def _cmd_generate_action_dataset(
     moves_per_start: int,
     num_workers: int,
     clap_batch_size: int,
+    clap_device: str,
     estimate_only: bool,
     yes: bool,
     progress: bool,
@@ -1129,6 +1145,7 @@ def _cmd_generate_action_dataset(
         moves_per_start=moves_per_start,
         num_workers=num_workers,
         clap_batch_size=clap_batch_size,
+        clap_device=clap_device,
         render_timeout_seconds=render_timeout_seconds,
         skip_failed_actions=skip_failed_actions,
         shard_size=shard_size,
@@ -1227,6 +1244,7 @@ def main() -> None:
                 args.num_workers,
                 args.updates_per_tick,
                 args.clap_batch_size,
+                args.clap_device,
                 args.epsilon_decay_steps,
                 args.max_episode_steps,
             )
@@ -1262,6 +1280,7 @@ def main() -> None:
                 args.moves_per_start,
                 args.num_workers,
                 args.clap_batch_size,
+                args.clap_device,
                 args.estimate_only,
                 args.yes,
                 args.progress,

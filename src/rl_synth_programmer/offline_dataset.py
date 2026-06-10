@@ -32,6 +32,7 @@ class ActionDatasetConfig:
         Generation visits one move per pair per round so small max_states values cover more presets first.
     num_workers: number of parallel render worker processes.
     clap_batch_size: number of rendered audio buffers embedded per CLAP batch.
+    clap_device: CLAP embedding device, either auto, cpu, or cuda.
     action_step: normalized parameter delta used by each +/- action.
     seed: deterministic seed for curriculum/coordinator setup.
     render_timeout_seconds: timeout for one render batch/chunk; None disables it.
@@ -57,6 +58,7 @@ class ActionDatasetConfig:
     moves_per_start: int = 4
     num_workers: int = 1
     clap_batch_size: int = 8
+    clap_device: str = "auto"
     action_step: float = 0.05
     seed: int = 7
     render_timeout_seconds: float | None = 300.0
@@ -120,7 +122,7 @@ def _sample_state_count(config: ActionDatasetConfig, pairs: list[tuple[int, int]
 
 
 def _build_config(config: ActionDatasetConfig) -> tuple[SynthEnvConfig, CurriculumConfig]:
-    reward = RewardConfig(mode=config.reward_mode)
+    reward = RewardConfig(mode=config.reward_mode, clap_device=config.clap_device)
     env = SynthEnvConfig(
         host=SynthHostConfig(plugin_path=config.plugin_path),
         reward=reward,
@@ -580,6 +582,8 @@ def estimate_action_dataset(config: ActionDatasetConfig, *, progress: bool = Tru
         "sample_best_reward": float(np.max(rewards)),
         "num_workers": int(config.num_workers),
         "clap_batch_size": int(config.clap_batch_size),
+        "clap_device": str(config.clap_device),
+        "resolved_clap_device": str(getattr(embedder, "device", config.clap_device)),
         "render_timeout_seconds": config.render_timeout_seconds,
         "max_state_seconds": config.max_state_seconds,
         "reload_workers_every_renders": int(config.reload_workers_every_renders),
@@ -974,6 +978,8 @@ def generate_action_dataset(
         "plugin_path": str(config.plugin_path),
         "manifest_path": str(config.manifest_path),
         "reward_mode": config.reward_mode,
+        "clap_device": str(config.clap_device),
+        "resolved_clap_device": str(getattr(embedder, "device", config.clap_device)),
         "action_step": float(config.action_step),
         "action_step_mode": "calibrated" if bool(config.action_step_calibration) else "fixed",
         "action_step_by_parameter": {spec.stable_id: float(coordinator.config.action_steps_by_parameter[spec.stable_id]) for spec in parameter_specs},
@@ -1001,6 +1007,7 @@ def generate_action_dataset(
             "moves_per_start": int(config.moves_per_start),
             "num_workers": int(config.num_workers),
             "clap_batch_size": int(config.clap_batch_size),
+            "clap_device": str(config.clap_device),
             "seed": int(config.seed),
             "render_timeout_seconds": config.render_timeout_seconds,
             "skip_failed_actions": bool(config.skip_failed_actions),

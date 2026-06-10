@@ -24,7 +24,7 @@ export SYNTH_PLUGIN="/path/to/Instrument.vst3"
 export RUN_FOLDER="artifacts/my_synth_run"
 ```
 
-CLAP weights and text-model files are cached under `clap-weights/`. The code checks that local cache first and downloads missing assets from Hugging Face when CLAP is used. For offline-only smoke runs, make sure the cache already contains `CLAP_weights_2023.pth` and the required text model directory, such as `clap-weights/gpt2/`.
+CLAP weights and text-model files are cached under `clap-weights/`. The code checks that local cache first and downloads missing assets from Hugging Face when CLAP is used. CLAP embedding uses `--clap-device auto` by default, selecting CUDA when `torch.cuda.is_available()` is true and falling back to CPU otherwise. For offline-only smoke runs, make sure the cache already contains `CLAP_weights_2023.pth` and the required text model directory, such as `clap-weights/gpt2/`.
 
 ## Main Workflow
 
@@ -58,6 +58,7 @@ rl-synth generate-action-dataset \
   --moves-per-start 8 \
   --num-workers 4 \
   --clap-batch-size 8 \
+  --clap-device auto \
   --action-step-calibration \
   --render-timeout-seconds 300 \
   --max-state-seconds 90 \
@@ -102,6 +103,7 @@ rl-synth train-dqn \
   --run-folder "$RUN_FOLDER" \
   --reward-mode clap \
   --steps 20000 \
+  --clap-device auto \
   --epsilon-decay-steps 50000 \
   --max-episode-steps 48
 ```
@@ -121,10 +123,10 @@ rl-synth evaluate \
 rl-synth inspect-plugin --plugin "$SYNTH_PLUGIN" --run-folder artifacts/inspect
 rl-synth render --plugin "$SYNTH_PLUGIN" --note 60 --duration 1.0
 rl-synth generate-target-set --plugin "$SYNTH_PLUGIN" --run-folder "$RUN_FOLDER" --subset-limit 12
-rl-synth generate-action-dataset --plugin "$SYNTH_PLUGIN" --run-folder "$RUN_FOLDER" --max-states 256
+rl-synth generate-action-dataset --plugin "$SYNTH_PLUGIN" --run-folder "$RUN_FOLDER" --max-states 256 --clap-device auto
 rl-synth compare-architectures --dataset "$RUN_FOLDER/action_dataset/dataset.npz" --config "$RUN_FOLDER/sweep.json" --out-dir "$RUN_FOLDER/architecture_sweep"
 rl-synth random-agent --plugin "$SYNTH_PLUGIN" --run-folder "$RUN_FOLDER" --episodes 4
-rl-synth train-dqn --plugin "$SYNTH_PLUGIN" --run-folder "$RUN_FOLDER" --reward-mode clap --steps 2000
+rl-synth train-dqn --plugin "$SYNTH_PLUGIN" --run-folder "$RUN_FOLDER" --reward-mode clap --steps 2000 --clap-device auto
 rl-synth evaluate --plugin "$SYNTH_PLUGIN" --run-folder "$RUN_FOLDER" --episodes 8
 rl-synth search-feature-change-models --artifacts-root artifacts --out-dir artifacts/architecture_search/feature_change --epochs 5 --cv-folds 1 --dataloader-num-workers 2
 rl-synth full-smoke --plugin "$SYNTH_PLUGIN" --run-folder artifacts/full_smoke
@@ -263,7 +265,8 @@ rl-synth train-dqn \
   --steps 2000 \
   --num-workers 4 \
   --updates-per-tick 1 \
-  --clap-batch-size 8
+  --clap-batch-size 8 \
+  --clap-device auto
 ```
 
 The batched path activates automatically when `--num-workers > 1`. It uses multiple synth-render worker processes and one shared CLAP embedder in the parent process.

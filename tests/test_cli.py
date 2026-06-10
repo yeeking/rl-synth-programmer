@@ -38,6 +38,7 @@ class CliLoggingOptionsTest(unittest.TestCase):
         self.assertEqual(args.num_workers, 1)
         self.assertEqual(args.updates_per_tick, 1)
         self.assertIsNone(args.clap_batch_size)
+        self.assertEqual(args.clap_device, "auto")
         self.assertIsNone(args.epsilon_decay_steps)
         self.assertIsNone(args.max_episode_steps)
 
@@ -87,6 +88,7 @@ class CliLoggingOptionsTest(unittest.TestCase):
         self.assertEqual(args.moves_per_start, 4)
         self.assertEqual(args.num_workers, 1)
         self.assertEqual(args.clap_batch_size, 8)
+        self.assertEqual(args.clap_device, "auto")
         self.assertFalse(args.estimate_only)
         self.assertFalse(args.yes)
         self.assertEqual(args.render_timeout_seconds, 300.0)

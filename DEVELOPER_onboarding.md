@@ -110,6 +110,8 @@ The observation size is only known after the first embedding is available, so `r
 - `random`: no embedder; reward is random and mainly useful for plumbing checks.
 - `clap`: `CLAPEmbedder` embeds rendered audio through `msclap`.
 
+`RewardConfig.clap_device` defaults to `auto`: CLAP embedding uses CUDA when PyTorch reports `torch.cuda.is_available()`, otherwise CPU. `generate-action-dataset` and `train-dqn` expose this as `--clap-device auto|cpu|cuda`; explicit `cuda` asserts if CUDA is not visible.
+
 `SimilarityRewardModel` supports:
 
 - `cosine`: `1 - cosine_similarity`

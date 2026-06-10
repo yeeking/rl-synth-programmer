@@ -8,6 +8,7 @@ import numpy as np
 import yaml
 
 from .config import RewardConfig
+from .logging_utils import stage_log
 from .optional_deps import require_dependency
 
 CLAP_WEIGHTS_DIR = Path("clap-weights")
@@ -42,7 +43,22 @@ class CLAPEmbedder:
         msclap = require_dependency("msclap", "ml")
         wrapper_mod = require_dependency("msclap.CLAPWrapper", "ml")
         model_fp, text_model_path = self._resolve_clap_assets(config, wrapper_mod)
-        self._model = self._build_model(msclap, model_fp, config.clap_version, text_model_path)
+        self.device = self._resolve_device(config.clap_device)
+        stage_log(f"Loading CLAP embedder on device={self.device}.")
+        self._model = self._build_model(msclap, model_fp, config.clap_version, text_model_path, use_cuda=self.device == "cuda")
+
+    @staticmethod
+    def _resolve_device(device: str) -> str:
+        requested = str(device or "auto").lower()
+        assert requested in {"auto", "cpu", "cuda"}, f"Unsupported CLAP device: {device}. Expected auto, cpu, or cuda."
+        if requested == "cpu":
+            return "cpu"
+        torch = require_dependency("torch", "ml")
+        cuda_available = bool(torch.cuda.is_available())
+        if requested == "cuda":
+            assert cuda_available, "CLAP device was set to cuda, but torch.cuda.is_available() is false."
+            return "cuda"
+        return "cuda" if cuda_available else "cpu"
 
     @staticmethod
     def _resolve_clap_assets(config: RewardConfig, wrapper_mod) -> tuple[str, str]:
@@ -109,9 +125,9 @@ class CLAPEmbedder:
         return text_model_path
 
     @staticmethod
-    def _build_model(msclap, model_fp: str | None, version: str, text_model_path: str | None):
+    def _build_model(msclap, model_fp: str | None, version: str, text_model_path: str | None, *, use_cuda: bool):
         if text_model_path is None:
-            return msclap.CLAP(version=version, model_fp=model_fp, use_cuda=False)
+            return msclap.CLAP(version=version, model_fp=model_fp, use_cuda=use_cuda)
 
         wrapper_mod = require_dependency("msclap.CLAPWrapper", "ml")
         wrapper = wrapper_mod.CLAPWrapper.__new__(wrapper_mod.CLAPWrapper)
@@ -135,7 +151,7 @@ class CLAPEmbedder:
             config_data["text_decoder"] = text_model_path
         wrapper.config_as_str = yaml.safe_dump(config_data)
         wrapper.model_fp = model_fp
-        wrapper.use_cuda = False
+        wrapper.use_cuda = bool(use_cuda)
         if "clapcap" in version:
             wrapper.clapcap, wrapper.tokenizer, wrapper.args = wrapper.load_clapcap()
         else:
@@ -158,6 +174,8 @@ class CLAPEmbedder:
             for audio, sample_rate in zip(audios, sample_rates)
         ]
         tensor = torch.tensor(np.stack(processed_batch), dtype=torch.float32).reshape(len(processed_batch), 1, -1)
+        if self.device == "cuda":
+            tensor = tensor.cuda()
         with torch.no_grad():
             embedding = self._model._get_audio_embeddings(tensor)
         return np.asarray(embedding.detach().cpu().numpy(), dtype=np.float32)

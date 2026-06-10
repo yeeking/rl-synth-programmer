@@ -29,6 +29,15 @@ class FakeWrapperModule:
         self.__file__ = str(root / "CLAPWrapper.py")
 
 
+class FakeTorch:
+    class cuda:
+        available = False
+
+        @staticmethod
+        def is_available():
+            return FakeTorch.cuda.available
+
+
 class RewardTests(unittest.TestCase):
     def test_cosine_distance_and_reward(self):
         model = SimilarityRewardModel(metric="cosine")
@@ -91,6 +100,22 @@ class RewardTests(unittest.TestCase):
 
             self.assertEqual(checkpoint, weights_dir / "CLAP_weights_2023.pth")
             self.assertTrue(checkpoint.exists())
+
+    def test_clap_device_auto_uses_cuda_when_available(self):
+        FakeTorch.cuda.available = True
+        with patch("rl_synth_programmer.reward.require_dependency", return_value=FakeTorch):
+            self.assertEqual(CLAPEmbedder._resolve_device("auto"), "cuda")
+
+    def test_clap_device_auto_falls_back_to_cpu(self):
+        FakeTorch.cuda.available = False
+        with patch("rl_synth_programmer.reward.require_dependency", return_value=FakeTorch):
+            self.assertEqual(CLAPEmbedder._resolve_device("auto"), "cpu")
+
+    def test_clap_device_cuda_asserts_when_unavailable(self):
+        FakeTorch.cuda.available = False
+        with patch("rl_synth_programmer.reward.require_dependency", return_value=FakeTorch):
+            with self.assertRaises(AssertionError):
+                CLAPEmbedder._resolve_device("cuda")
 
 
 if __name__ == "__main__":
