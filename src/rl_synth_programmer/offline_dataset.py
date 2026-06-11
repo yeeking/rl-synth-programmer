@@ -27,9 +27,13 @@ class ActionDatasetConfig:
     manifest_path: target manifest produced by generate-target-set.
     output_dir: run folder where action_dataset/ artifacts are written.
     reward_mode: reward backend; v1 supports CLAP-backed distance rewards.
-    max_states: maximum dataset rows to generate.
-    moves_per_start: maximum greedy best-action rounds to collect for each target/start preset pair.
-        Generation visits one move per pair per round so small max_states values cover more presets first.
+    rows_to_generate: target number of dataset rows to write. Each row is one current synth
+        state plus dense labels for every available +/- parameter action. Generation keeps
+        cycling across target/start preset pairs until this many rows are written, unless every
+        pair becomes inactive because of skipped slow states.
+    moves_per_cycle: number of greedy best-action moves to take from one target/start pair
+        before moving to the next pair in the cycle. When the generator returns to that pair
+        on a later cycle, it continues from the last state reached rather than resetting.
     num_workers: number of parallel render worker processes.
     clap_batch_size: number of rendered audio buffers embedded per CLAP batch.
     clap_device: CLAP embedding device, either auto, cpu, or cuda.
@@ -54,8 +58,8 @@ class ActionDatasetConfig:
     manifest_path: Path
     output_dir: Path
     reward_mode: str = "clap"
-    max_states: int = 256
-    moves_per_start: int = 4
+    rows_to_generate: int = 256
+    moves_per_cycle: int = 4
     num_workers: int = 1
     clap_batch_size: int = 8
     clap_device: str = "auto"
@@ -85,6 +89,7 @@ class _PairRolloutState:
     embedding: np.ndarray
     distance: float
     observation: np.ndarray
+    moves_taken: int = 0
     active: bool = True
 
 
@@ -118,7 +123,8 @@ def _target_start_pairs(targets: list[TargetSpec]) -> list[tuple[int, int]]:
 
 
 def _sample_state_count(config: ActionDatasetConfig, pairs: list[tuple[int, int]]) -> int:
-    return min(int(config.max_states), len(pairs) * int(config.moves_per_start))
+    _ = pairs
+    return int(config.rows_to_generate)
 
 
 def _build_config(config: ActionDatasetConfig) -> tuple[SynthEnvConfig, CurriculumConfig]:
@@ -504,8 +510,8 @@ def _evaluate_all_actions(
 
 
 def estimate_action_dataset(config: ActionDatasetConfig, *, progress: bool = True) -> dict[str, Any]:
-    assert config.max_states >= 1, f"max_states must be >= 1, got {config.max_states}"
-    assert config.moves_per_start >= 1, f"moves_per_start must be >= 1, got {config.moves_per_start}"
+    assert config.rows_to_generate >= 1, f"rows_to_generate must be >= 1, got {config.rows_to_generate}"
+    assert config.moves_per_cycle >= 1, f"moves_per_cycle must be >= 1, got {config.moves_per_cycle}"
     env_config, curriculum_config = _build_config(config)
     stage_log("Loading host and manifest for dataset estimate.")
     probe_host = SynthHost(env_config.host)
@@ -591,7 +597,7 @@ def estimate_action_dataset(config: ActionDatasetConfig, *, progress: bool = Tru
         "reload_workers_on_render_slowdown": bool(config.reload_workers_on_render_slowdown),
         "action_step_calibration": bool(config.action_step_calibration),
         "calibration_probe_states": int(config.calibration_probe_states),
-        "sampling_scheme": "round_robin_greedy",
+        "sampling_scheme": "cyclic_greedy",
         "memory": _memory_snapshot(),
     }
     stage_log(
@@ -735,17 +741,17 @@ def generate_action_dataset(
     config: ActionDatasetConfig,
     *,
     progress: bool = True,
-    yes: bool = False,
+    confirm_large_run: bool = False,
     estimate: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    assert config.max_states >= 1, f"max_states must be >= 1, got {config.max_states}"
-    assert config.moves_per_start >= 1, f"moves_per_start must be >= 1, got {config.moves_per_start}"
+    assert config.rows_to_generate >= 1, f"rows_to_generate must be >= 1, got {config.rows_to_generate}"
+    assert config.moves_per_cycle >= 1, f"moves_per_cycle must be >= 1, got {config.moves_per_cycle}"
     if estimate is None:
         estimate = estimate_action_dataset(config, progress=progress)
-    if int(estimate["estimated_total_renders"]) > LARGE_RENDER_WARNING_THRESHOLD and not yes:
+    if int(estimate["estimated_total_renders"]) > LARGE_RENDER_WARNING_THRESHOLD and not confirm_large_run:
         raise RuntimeError(
             "Dataset generation is estimated to require "
-            f"{estimate['estimated_total_renders']} renders. Re-run with --yes to confirm."
+            f"{estimate['estimated_total_renders']} renders. Re-run with --confirm-large-run to confirm."
         )
 
     env_config, curriculum_config = _build_config(config)
@@ -813,9 +819,9 @@ def generate_action_dataset(
         total_action_renders = total_states * int(coordinator.action_size)
         progress_bar = make_progress_bar(total=total_action_renders, desc="action renders", enabled=progress)
         pair_states: dict[int, _PairRolloutState] = {}
-        for move_index in range(config.moves_per_start):
-            if total_written_rows + len(rows["observations"]) >= total_states:
-                break
+        cycle_index = 0
+        while total_written_rows + len(rows["observations"]) < total_states:
+            rows_before_cycle = total_written_rows + len(rows["observations"])
             for pair_index, (target_index, start_index) in enumerate(pairs):
                 if total_written_rows + len(rows["observations"]) >= total_states:
                     break
@@ -841,96 +847,104 @@ def generate_action_dataset(
                     pair_states[pair_index] = pair_state
                 if not pair_state.active:
                     continue
-                current_row_number = total_written_rows + len(rows["observations"]) + 1
-                state_started = perf_counter()
-                deadline = None
-                if config.max_state_seconds is not None and float(config.max_state_seconds) > 0.0:
-                    deadline = state_started + float(config.max_state_seconds)
-                (
-                    rewards,
-                    next_params_list,
-                    next_embeddings,
-                    next_distances,
-                    failed_actions,
-                    render_seconds,
-                    rendered_action_count,
-                    slow_render_chunk_count,
-                ) = _evaluate_all_actions(
-                    coordinator,
-                    render_pool,
-                    embedder,
-                    target,
-                    pair_state.params,
-                    pair_state.distance,
-                    batch_size=config.clap_batch_size,
-                    timeout_seconds=config.render_timeout_seconds,
-                    skip_failed_actions=config.skip_failed_actions,
-                    failed_action_reward=config.failed_action_reward,
-                    render_chunk_size=config.render_chunk_size or config.num_workers,
-                    state_number=current_row_number,
-                    deadline=deadline,
-                    render_progress=progress_bar,
-                    reload_after_rendered=_reload_after_rendered,
-                    render_slowdown_baseline=float(np.mean(render_mean_history)) if render_mean_history else None,
-                    render_slowdown_threshold=float(config.preset_render_slowdown_threshold),
-                    render_slowdown_context=(
-                        f"target={target.target_id} start={start.target_id} "
-                        f"target_index={target_index} start_index={start_index} "
-                        f"move={move_index} state={current_row_number}/{total_states}"
-                    ),
-                    reload_on_render_slowdown=_reload_render_pool_now
-                    if bool(config.reload_workers_on_render_slowdown)
-                    else None,
-                )
-                best_action = int(np.argmax(rewards))
-                mean_render_seconds_per_action = float(render_seconds / max(1, rendered_action_count))
-                if (
-                    float(config.preset_render_slowdown_threshold) > 0.0
-                    and render_mean_history
-                    and rendered_action_count > 0
-                    and slow_render_chunk_count == 0
-                ):
-                    baseline = float(np.mean(render_mean_history))
-                    allowed = baseline * float(config.preset_render_slowdown_threshold)
-                    assert mean_render_seconds_per_action <= allowed, (
-                        "Preset render slowdown detected: "
-                        f"target={target.target_id} start={start.target_id} "
-                        f"target_index={target_index} start_index={start_index} "
-                        f"move={move_index} state={current_row_number}/{total_states} "
-                        f"mean_render_seconds_per_action={mean_render_seconds_per_action:.6f} "
-                        f"baseline_mean_seconds_per_action={baseline:.6f} "
-                        f"threshold_multiplier={float(config.preset_render_slowdown_threshold):.3f} "
-                        f"rendered_actions={rendered_action_count} failed_actions={len(failed_actions)}"
+                for _cycle_move in range(config.moves_per_cycle):
+                    if total_written_rows + len(rows["observations"]) >= total_states:
+                        break
+                    move_index = int(pair_state.moves_taken)
+                    # pair_state is deliberately updated after each successful row. When this
+                    # pair is revisited in a later cycle, generation resumes from that latest
+                    # greedy best-action state rather than from the original preset start.
+                    assert pair_state.active, f"Pair {pair_index} became inactive during cycle {cycle_index}."
+                    current_row_number = total_written_rows + len(rows["observations"]) + 1
+                    state_started = perf_counter()
+                    deadline = None
+                    if config.max_state_seconds is not None and float(config.max_state_seconds) > 0.0:
+                        deadline = state_started + float(config.max_state_seconds)
+                    (
+                        rewards,
+                        next_params_list,
+                        next_embeddings,
+                        next_distances,
+                        failed_actions,
+                        render_seconds,
+                        rendered_action_count,
+                        slow_render_chunk_count,
+                    ) = _evaluate_all_actions(
+                        coordinator,
+                        render_pool,
+                        embedder,
+                        target,
+                        pair_state.params,
+                        pair_state.distance,
+                        batch_size=config.clap_batch_size,
+                        timeout_seconds=config.render_timeout_seconds,
+                        skip_failed_actions=config.skip_failed_actions,
+                        failed_action_reward=config.failed_action_reward,
+                        render_chunk_size=config.render_chunk_size or config.num_workers,
+                        state_number=current_row_number,
+                        deadline=deadline,
+                        render_progress=progress_bar,
+                        reload_after_rendered=_reload_after_rendered,
+                        render_slowdown_baseline=float(np.mean(render_mean_history)) if render_mean_history else None,
+                        render_slowdown_threshold=float(config.preset_render_slowdown_threshold),
+                        render_slowdown_context=(
+                            f"target={target.target_id} start={start.target_id} "
+                            f"target_index={target_index} start_index={start_index} "
+                            f"cycle={cycle_index} move={move_index} state={current_row_number}/{total_states}"
+                        ),
+                        reload_on_render_slowdown=_reload_render_pool_now
+                        if bool(config.reload_workers_on_render_slowdown)
+                        else None,
                     )
-                state_skipped = int(
-                    config.max_state_seconds is not None
-                    and float(config.max_state_seconds) > 0.0
-                    and perf_counter() >= state_started + float(config.max_state_seconds)
-                    and len(failed_actions) > 0
-                )
-                rows["observations"].append(np.asarray(pair_state.observation, dtype=np.float32))
-                rows["action_rewards"].append(rewards)
-                rows["current_distances"].append(float(pair_state.distance))
-                rows["target_indices"].append(int(target_index))
-                rows["start_indices"].append(int(start_index))
-                rows["move_indices"].append(int(move_index))
-                rows["best_actions"].append(best_action)
-                rows["best_rewards"].append(float(rewards[best_action]))
-                rows["failed_action_counts"].append(len(failed_actions))
-                rows["state_skipped"].append(state_skipped)
-                rows["render_seconds"].append(float(render_seconds))
-                rows["mean_render_seconds_per_action"].append(mean_render_seconds_per_action)
-                rows["slow_render_chunk_counts"].append(int(slow_render_chunk_count))
-                if rendered_action_count > 0 and not state_skipped:
-                    render_mean_history.append(mean_render_seconds_per_action)
-                if state_skipped:
-                    stage_log(
-                        f"Skipping slow state {current_row_number}/{total_states}: "
-                        f"target={target.target_id} start={start.target_id} "
-                        f"elapsed={perf_counter() - state_started:.2f}s failed_actions={len(failed_actions)}."
+                    best_action = int(np.argmax(rewards))
+                    mean_render_seconds_per_action = float(render_seconds / max(1, rendered_action_count))
+                    if (
+                        float(config.preset_render_slowdown_threshold) > 0.0
+                        and render_mean_history
+                        and rendered_action_count > 0
+                        and slow_render_chunk_count == 0
+                    ):
+                        baseline = float(np.mean(render_mean_history))
+                        allowed = baseline * float(config.preset_render_slowdown_threshold)
+                        assert mean_render_seconds_per_action <= allowed, (
+                            "Preset render slowdown detected: "
+                            f"target={target.target_id} start={start.target_id} "
+                            f"target_index={target_index} start_index={start_index} "
+                            f"cycle={cycle_index} move={move_index} state={current_row_number}/{total_states} "
+                            f"mean_render_seconds_per_action={mean_render_seconds_per_action:.6f} "
+                            f"baseline_mean_seconds_per_action={baseline:.6f} "
+                            f"threshold_multiplier={float(config.preset_render_slowdown_threshold):.3f} "
+                            f"rendered_actions={rendered_action_count} failed_actions={len(failed_actions)}"
+                        )
+                    state_skipped = int(
+                        config.max_state_seconds is not None
+                        and float(config.max_state_seconds) > 0.0
+                        and perf_counter() >= state_started + float(config.max_state_seconds)
+                        and len(failed_actions) > 0
                     )
-                    pair_state.active = False
-                else:
+                    rows["observations"].append(np.asarray(pair_state.observation, dtype=np.float32))
+                    rows["action_rewards"].append(rewards)
+                    rows["current_distances"].append(float(pair_state.distance))
+                    rows["target_indices"].append(int(target_index))
+                    rows["start_indices"].append(int(start_index))
+                    rows["move_indices"].append(int(move_index))
+                    rows["best_actions"].append(best_action)
+                    rows["best_rewards"].append(float(rewards[best_action]))
+                    rows["failed_action_counts"].append(len(failed_actions))
+                    rows["state_skipped"].append(state_skipped)
+                    rows["render_seconds"].append(float(render_seconds))
+                    rows["mean_render_seconds_per_action"].append(mean_render_seconds_per_action)
+                    rows["slow_render_chunk_counts"].append(int(slow_render_chunk_count))
+                    if rendered_action_count > 0 and not state_skipped:
+                        render_mean_history.append(mean_render_seconds_per_action)
+                    if state_skipped:
+                        stage_log(
+                            f"Skipping slow state {current_row_number}/{total_states}: "
+                            f"target={target.target_id} start={start.target_id} "
+                            f"elapsed={perf_counter() - state_started:.2f}s failed_actions={len(failed_actions)}."
+                        )
+                        pair_state.active = False
+                        break
                     pair_state.params = next_params_list[best_action]
                     pair_state.embedding = next_embeddings[best_action]
                     pair_state.distance = next_distances[best_action]
@@ -939,25 +953,32 @@ def generate_action_dataset(
                         target.embedding,
                         pair_state.params,
                     )
-                if failed_actions:
-                    stage_log(
-                        f"State {current_row_number}/{total_states} completed with "
-                        f"{len(failed_actions)} failed action(s); best_action={best_action}."
+                    pair_state.moves_taken += 1
+                    if failed_actions:
+                        stage_log(
+                            f"State {current_row_number}/{total_states} completed with "
+                            f"{len(failed_actions)} failed action(s); best_action={best_action}."
+                        )
+                    progress_bar.set_postfix(
+                        {
+                            "state": f"{current_row_number}/{total_states}",
+                            "target": target.target_id,
+                            "best": f"{float(rewards[best_action]):.4f}",
+                        }
                     )
-                progress_bar.set_postfix(
-                    {
-                        "state": f"{current_row_number}/{total_states}",
-                        "target": target.target_id,
-                        "best": f"{float(rewards[best_action]):.4f}",
-                    }
-                )
-                if len(rows["observations"]) >= max(1, config.shard_size):
-                    path = _write_shard(shards_dir, rows, shard_index)
-                    if path is not None:
-                        shard_paths.append(path)
-                        total_written_rows += len(rows["observations"])
-                        shard_index += 1
-                        rows = _empty_rows()
+                    if len(rows["observations"]) >= max(1, config.shard_size):
+                        path = _write_shard(shards_dir, rows, shard_index)
+                        if path is not None:
+                            shard_paths.append(path)
+                            total_written_rows += len(rows["observations"])
+                            shard_index += 1
+                            rows = _empty_rows()
+            rows_after_cycle = total_written_rows + len(rows["observations"])
+            assert rows_after_cycle > rows_before_cycle, (
+                "No dataset rows were generated during a complete source-target cycle. "
+                "All pairs may have become inactive due to slow-state skips before rows_to_generate was reached."
+            )
+            cycle_index += 1
         progress_bar.close()
     finally:
         _close_render_pool(render_pool)
@@ -999,12 +1020,12 @@ def generate_action_dataset(
         "shapes": {key: list(value.shape) for key, value in arrays.items()},
         "dtypes": {key: str(value.dtype) for key, value in arrays.items()},
         "generation_seconds": float(perf_counter() - started),
-        "sampling_scheme": "round_robin_greedy",
+        "sampling_scheme": "cyclic_greedy",
         "memory": _memory_snapshot(),
         "estimate": estimate,
         "args": {
-            "max_states": int(config.max_states),
-            "moves_per_start": int(config.moves_per_start),
+            "rows_to_generate": int(config.rows_to_generate),
+            "moves_per_cycle": int(config.moves_per_cycle),
             "num_workers": int(config.num_workers),
             "clap_batch_size": int(config.clap_batch_size),
             "clap_device": str(config.clap_device),

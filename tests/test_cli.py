@@ -84,13 +84,13 @@ class CliLoggingOptionsTest(unittest.TestCase):
             ]
         )
         self.assertEqual(args.reward_mode, "clap")
-        self.assertEqual(args.max_states, 256)
-        self.assertEqual(args.moves_per_start, 4)
+        self.assertEqual(args.rows_to_generate, 256)
+        self.assertEqual(args.moves_per_cycle, 4)
         self.assertEqual(args.num_workers, 1)
         self.assertEqual(args.clap_batch_size, 8)
         self.assertEqual(args.clap_device, "auto")
         self.assertFalse(args.estimate_only)
-        self.assertFalse(args.yes)
+        self.assertFalse(args.confirm_large_run)
         self.assertEqual(args.render_timeout_seconds, 300.0)
         self.assertTrue(args.skip_failed_actions)
         self.assertEqual(args.shard_size, 16)
@@ -106,6 +106,26 @@ class CliLoggingOptionsTest(unittest.TestCase):
         self.assertEqual(args.calibration_min_step, 0.01)
         self.assertEqual(args.calibration_max_step, 0.5)
         self.assertTrue(args.progress)
+
+    def test_generate_action_dataset_parser_accepts_legacy_aliases(self) -> None:
+        parser = _base_parser()
+        args = parser.parse_args(
+            [
+                "generate-action-dataset",
+                "--plugin",
+                "/tmp/test.vst3",
+                "--run-folder",
+                "artifacts/test_run",
+                "--max-states",
+                "12",
+                "--moves-per-start",
+                "3",
+                "--yes",
+            ]
+        )
+        self.assertEqual(args.rows_to_generate, 12)
+        self.assertEqual(args.moves_per_cycle, 3)
+        self.assertTrue(args.confirm_large_run)
 
     def test_compare_architectures_parser_defaults(self) -> None:
         parser = _base_parser()

@@ -54,8 +54,8 @@ Generate a reusable offline action dataset. Each row stores the current observat
 rl-synth generate-action-dataset \
   --plugin "$SYNTH_PLUGIN" \
   --run-folder "$RUN_FOLDER" \
-  --max-states 1024 \
-  --moves-per-start 8 \
+  --rows-to-generate 1024 \
+  --moves-per-cycle 8 \
   --num-workers 4 \
   --clap-batch-size 8 \
   --clap-device auto \
@@ -63,7 +63,7 @@ rl-synth generate-action-dataset \
   --render-timeout-seconds 300 \
   --max-state-seconds 90 \
   --shard-size 16 \
-  --yes
+  --confirm-large-run
 ```
 
 Preview cost before writing `dataset.npz`:
@@ -123,7 +123,7 @@ rl-synth evaluate \
 rl-synth inspect-plugin --plugin "$SYNTH_PLUGIN" --run-folder artifacts/inspect
 rl-synth render --plugin "$SYNTH_PLUGIN" --note 60 --duration 1.0
 rl-synth generate-target-set --plugin "$SYNTH_PLUGIN" --run-folder "$RUN_FOLDER" --subset-limit 12
-rl-synth generate-action-dataset --plugin "$SYNTH_PLUGIN" --run-folder "$RUN_FOLDER" --max-states 256 --clap-device auto
+rl-synth generate-action-dataset --plugin "$SYNTH_PLUGIN" --run-folder "$RUN_FOLDER" --rows-to-generate 256 --clap-device auto
 rl-synth compare-architectures --dataset "$RUN_FOLDER/action_dataset/dataset.npz" --config "$RUN_FOLDER/sweep.json" --out-dir "$RUN_FOLDER/architecture_sweep"
 rl-synth random-agent --plugin "$SYNTH_PLUGIN" --run-folder "$RUN_FOLDER" --episodes 4
 rl-synth train-dqn --plugin "$SYNTH_PLUGIN" --run-folder "$RUN_FOLDER" --reward-mode clap --steps 2000 --clap-device auto
@@ -136,9 +136,11 @@ rl-synth full-smoke --plugin "$SYNTH_PLUGIN" --run-folder artifacts/full_smoke
 
 ## Offline Dataset Details
 
-`generate-action-dataset` samples target/start preset pairs round-robin. Before rollout, it probes a few start states to calibrate per-parameter action steps by embedding-distance sensitivity. Parameters that need larger normalized movement to change the sound get larger steps; highly sensitive parameters get smaller steps. Use `--no-action-step-calibration` to keep the fixed global `--action-step` behavior.
+`generate-action-dataset` samples target/start preset pairs in cycles. Before rollout, it probes a few start states to calibrate per-parameter action steps by embedding-distance sensitivity. Parameters that need larger normalized movement to change the sound get larger steps; highly sensitive parameters get smaller steps. Use `--no-action-step-calibration` to keep the fixed global `--action-step` behavior.
 
-It renders move 0 for each pair first, then move 1 for each pair, up to `--moves-per-start` or `--max-states`. For every sampled state, it evaluates every discrete action and stores:
+`--rows-to-generate` is the target row count. For each target/start pair, the generator takes up to `--moves-per-cycle` greedy best-action moves, writing one row per move, then advances to the next pair. When it returns to a pair in a later cycle, it resumes from that pair's latest reached state rather than resetting to the original start preset. This continues until `--rows-to-generate` rows are written, unless every pair becomes inactive because slow states were skipped.
+
+For every sampled state, it evaluates every discrete action and stores:
 
 - `observations`: flattened `[target_embedding, current_embedding, delta_embedding, params]`
 - `action_rewards`: immediate reward for each action
@@ -151,12 +153,17 @@ Calibration metadata includes `action_step_mode`, `action_step_by_parameter`, ac
 Useful reliability options:
 
 - `--render-timeout-seconds`: timeout for one render chunk
+- `--rows-to-generate`: target number of dataset rows to write
+- `--moves-per-cycle`: greedy moves per target/start pair before cycling to the next pair
+- `--confirm-large-run`: explicit confirmation for runs above the render-count warning threshold
 - `--skip-failed-actions` / `--no-skip-failed-actions`: continue with a large negative reward for timed-out actions or abort
 - `--max-state-seconds`: skip pathological slow states
 - `--reload-workers-every-renders`: periodically reload plugin worker processes
 - `--preset-render-slowdown-threshold`: detect sudden per-action render slowdowns
 - `--reload-workers-on-render-slowdown` / `--no-reload-workers-on-render-slowdown`: reload workers or assert on slowdown
 - `--calibration-probe-states`, `--calibration-probe-deltas`, `--calibration-reference-delta`, `--calibration-min-step`, `--calibration-max-step`: tune action-step calibration
+
+The older `--max-states`, `--moves-per-start`, and `--yes` flags are still accepted as compatibility aliases, but new scripts should use the clearer names above.
 
 ## Architecture Sweep
 
@@ -218,6 +225,8 @@ TensorBoard logs live under each architecture directory when `--tensorboard` is 
 ```bash
 tensorboard --logdir artifacts/architecture_search/feature_change
 ```
+
+The HParams table includes dataset/synth context, network type, architecture-shape fields such as CNN channel counts and RNN hidden sizes, loader settings, and validation/test ranking metrics.
 
 ### Latest Initial Search
 

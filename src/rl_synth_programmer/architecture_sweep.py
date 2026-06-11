@@ -8,6 +8,7 @@ from time import perf_counter
 from typing import Any
 
 import numpy as np
+import yaml
 
 from .logging_utils import make_progress_bar, stage_log
 from .manifest import append_csv, write_json
@@ -65,6 +66,38 @@ def _load_metadata(dataset_path: Path) -> dict[str, Any]:
     if metadata_path.exists():
         return json.loads(metadata_path.read_text())
     return {}
+
+
+def _dataset_label(dataset_path: Path) -> str:
+    parts = Path(dataset_path).parts
+    if len(parts) >= 3 and parts[-2] == "action_dataset":
+        return str(parts[-3])
+    return Path(dataset_path).stem
+
+
+def _tensorboard_context(
+    dataset_path: Path,
+    config: dict[str, Any],
+    metadata: dict[str, Any],
+    observations: np.ndarray,
+    rewards: np.ndarray,
+) -> dict[str, Any]:
+    return {
+        "dataset_name": _dataset_label(dataset_path),
+        "dataset_path": str(dataset_path),
+        "plugin_path": str(metadata.get("plugin_path", "")),
+        "synth": Path(str(metadata.get("plugin_path", ""))).stem if metadata.get("plugin_path") else "",
+        "reward_mode": str(metadata.get("reward_mode", "")),
+        "target": str(config.get("target", "all_action_rewards")),
+        "action_step_mode": str(metadata.get("action_step_mode", "fixed")),
+        "row_count": int(observations.shape[0]),
+        "observation_size": int(observations.shape[1]),
+        "action_count": int(rewards.shape[1]),
+        "embedding_size": int(metadata.get("embedding_size", 0) or 0),
+        "param_count": int(metadata.get("param_count", 0) or 0),
+        "expanded_row_count": int(metadata.get("expanded_row_count", observations.shape[0]) or observations.shape[0]),
+        "source_row_count": int(metadata.get("source_row_count", observations.shape[0]) or observations.shape[0]),
+    }
 
 
 def _split_indices(
@@ -353,15 +386,89 @@ def _make_dataloader(torch, observations, rewards, indices: np.ndarray, spec: di
     )
 
 
-def _tensorboard_hparams(spec: dict[str, Any], *, cv_folds: int = 1, fold: int | None = None) -> dict[str, Any]:
+def _list_ints(value: Any) -> list[int]:
+    if not isinstance(value, list):
+        return []
+    result = []
+    for item in value:
+        try:
+            result.append(int(item))
+        except (TypeError, ValueError):
+            continue
+    return result
+
+
+def _architecture_hparams(spec: dict[str, Any]) -> dict[str, Any]:
+    hidden_sizes = _list_ints(spec.get("hidden_sizes"))
+    channels = _list_ints(spec.get("channels"))
+    kernels = _list_ints(spec.get("kernel_sizes"))
+    param_hidden_sizes = _list_ints(spec.get("param_hidden_sizes"))
+    head_hidden_sizes = _list_ints(spec.get("head_hidden_sizes"))
+    fusion_hidden_sizes = _list_ints(spec.get("fusion_hidden_sizes"))
+    network_type = str(spec.get("type", ""))
+    return {
+        "architecture_name": str(spec.get("name", "")),
+        "architecture_type": network_type,
+        "network_type": network_type,
+        "learning_rate": float(spec.get("learning_rate", 0.0)),
+        "weight_decay": float(spec.get("weight_decay", 0.0)),
+        "dropout": float(spec.get("dropout", 0.0)),
+        "batch_size": int(spec.get("batch_size", 0)),
+        "epochs": int(spec.get("epochs", 0)),
+        "seed": int(spec.get("seed", 0)),
+        "num_workers": int(spec.get("num_workers", 0)),
+        "pin_memory": bool(spec.get("pin_memory", False)),
+        "accelerator": str(spec.get("accelerator", "auto")),
+        "devices": str(spec.get("devices", "auto")),
+        "hidden_layer_count": len(hidden_sizes),
+        "hidden_total_units": int(sum(hidden_sizes)),
+        "hidden_max_width": int(max(hidden_sizes)) if hidden_sizes else 0,
+        "residual_width": int(spec.get("width", 0) or 0),
+        "residual_blocks": int(spec.get("blocks", 0) or 0),
+        "conv_layer_count": len(channels),
+        "conv_channels": ",".join(str(value) for value in channels),
+        "conv_total_channels": int(sum(channels)),
+        "conv_max_channels": int(max(channels)) if channels else 0,
+        "kernel_sizes": ",".join(str(value) for value in kernels),
+        "kernel_max": int(max(kernels)) if kernels else 0,
+        "embedding_hidden_size": int(spec.get("embedding_hidden_size", 0) or 0),
+        "param_hidden_layer_count": len(param_hidden_sizes),
+        "param_hidden_total_units": int(sum(param_hidden_sizes)),
+        "head_hidden_layer_count": len(head_hidden_sizes),
+        "head_hidden_total_units": int(sum(head_hidden_sizes)),
+        "fusion_hidden_layer_count": len(fusion_hidden_sizes),
+        "fusion_hidden_total_units": int(sum(fusion_hidden_sizes)),
+        "recurrent_hidden_size": int(spec.get("hidden_size", 0) or 0),
+        "recurrent_layers": int(spec.get("layers", 0) or 0),
+        "bidirectional": bool(spec.get("bidirectional", False)),
+    }
+
+
+def _tensorboard_hparams(
+    spec: dict[str, Any],
+    *,
+    cv_folds: int = 1,
+    fold: int | None = None,
+    context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     hparams: dict[str, Any] = {}
+    hparams.update(_architecture_hparams(spec))
+    if context:
+        for key, value in context.items():
+            if isinstance(value, (str, int, float, bool)):
+                hparams[key] = value
+            elif value is not None:
+                hparams[key] = str(value)
     for key, value in spec.items():
+        prefixed_key = f"spec_{key}"
+        if prefixed_key in hparams:
+            continue
         if isinstance(value, (str, int, float, bool)):
-            hparams[key] = value
+            hparams[prefixed_key] = value
         elif isinstance(value, list):
-            hparams[key] = ",".join(str(item) for item in value)
+            hparams[prefixed_key] = ",".join(str(item) for item in value)
         elif value is not None:
-            hparams[key] = str(value)
+            hparams[prefixed_key] = str(value)
     hparams["cv_folds"] = int(cv_folds)
     if fold is not None:
         hparams["fold"] = int(fold)
@@ -381,13 +488,25 @@ def _tensorboard_hp_metrics(metrics: dict[str, Any]) -> dict[str, float]:
     }
 
 
-def _log_tensorboard_hparams(logger: Any, spec: dict[str, Any], metrics: dict[str, Any], *, cv_folds: int = 1, fold: int | None = None) -> None:
+def _log_tensorboard_hparams(
+    logger: Any,
+    spec: dict[str, Any],
+    metrics: dict[str, Any],
+    *,
+    cv_folds: int = 1,
+    fold: int | None = None,
+    context: dict[str, Any] | None = None,
+) -> None:
     if not logger:
         return
-    logger.log_hyperparams(
-        _tensorboard_hparams(spec, cv_folds=cv_folds, fold=fold),
-        _tensorboard_hp_metrics(metrics),
-    )
+    hparams = _tensorboard_hparams(spec, cv_folds=cv_folds, fold=fold, context=context)
+    hp_metrics = _tensorboard_hp_metrics(metrics)
+    logger.log_hyperparams(hparams, hp_metrics)
+    if hasattr(logger, "experiment"):
+        logger.experiment.add_hparams(hparams, hp_metrics, run_name="hparams")
+    log_dir = Path(str(logger.log_dir))
+    log_dir.mkdir(parents=True, exist_ok=True)
+    (log_dir / "hparams.yaml").write_text(yaml.safe_dump(hparams, sort_keys=True))
     if hasattr(logger, "save"):
         logger.save()
 
@@ -531,6 +650,7 @@ def _train_one(
     arch_dir: Path | None = None,
     cv_folds: int = 1,
     fold_index: int | None = None,
+    tensorboard_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     torch = require_dependency("torch", "ml")
     lightning = require_dependency("lightning.pytorch", "ml")
@@ -620,6 +740,7 @@ def _train_one(
         metrics,
         cv_folds=cv_folds,
         fold=fold_index,
+        context=tensorboard_context,
     )
     torch.save({"state_dict": network.state_dict(), "spec": spec, "metadata": metadata}, arch_dir / "checkpoint.pt")
     write_json(arch_dir / "metrics.json", metrics)
@@ -634,6 +755,7 @@ def _aggregate_cross_validation_metrics(
     *,
     arch_dir: Path,
     tensorboard: bool,
+    tensorboard_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     assert fold_metrics, "Cannot aggregate cross-validation metrics without folds."
     arch_dir.mkdir(parents=True, exist_ok=True)
@@ -684,7 +806,7 @@ def _aggregate_cross_validation_metrics(
     if tensorboard:
         lightning_loggers = require_dependency("lightning.pytorch.loggers", "ml")
         logger = lightning_loggers.TensorBoardLogger(save_dir=str(arch_dir), name="tensorboard", version="cv-summary")
-        _log_tensorboard_hparams(logger, spec, metrics, cv_folds=len(fold_metrics))
+        _log_tensorboard_hparams(logger, spec, metrics, cv_folds=len(fold_metrics), context=tensorboard_context)
     return metrics
 
 
@@ -705,6 +827,7 @@ def compare_architectures(
     metadata = _load_metadata(dataset_path)
     config = load_sweep_config(config_path)
     observations, rewards, metadata, group_ids, action_ids = _prepare_supervised_arrays(dataset, metadata, config)
+    tensorboard_context = _tensorboard_context(dataset_path, config, metadata, observations, rewards)
     out_dir.mkdir(parents=True, exist_ok=True)
     write_json(out_dir / "sweep_config.json", config)
     cv_folds = int(config.get("cv_folds", 1) or 1)
@@ -752,9 +875,16 @@ def compare_architectures(
                         arch_dir=arch_dir / f"fold-{fold_index:02d}",
                         cv_folds=cv_folds,
                         fold_index=fold_index,
+                        tensorboard_context=tensorboard_context,
                     )
                 )
-            metrics = _aggregate_cross_validation_metrics(spec, fold_metrics, arch_dir=arch_dir, tensorboard=tensorboard)
+            metrics = _aggregate_cross_validation_metrics(
+                spec,
+                fold_metrics,
+                arch_dir=arch_dir,
+                tensorboard=tensorboard,
+                tensorboard_context=tensorboard_context,
+            )
         else:
             metrics = _train_one(
                 spec,
@@ -769,6 +899,7 @@ def compare_architectures(
                 tensorboard=tensorboard,
                 arch_dir=arch_dir,
                 cv_folds=cv_folds,
+                tensorboard_context=tensorboard_context,
             )
         leaderboard.append(
             {

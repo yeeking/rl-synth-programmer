@@ -201,7 +201,7 @@ If the config contains `"target": "action_reward_as_feature_change_proxy"`, it e
 
 This mode preserves grouped train/val/test splits by original source row to avoid leaking actions from the same state across splits. Set `"cv_folds": 2` or higher in the sweep config, or pass `--cv-folds` to `search-feature-change-models` when using the generated config, to run grouped cross-validation. Use `3` or higher when you want distinct train/validation/test fold roles. By default the generated hypersearch config excludes rows with failed action renders and leaves cross-validation disabled.
 
-Architecture training is Lightning-backed. The repo still owns the search loop and artifact schema, while Lightning owns per-trial train/validation/test execution, deterministic seeding, progress, and TensorBoard logging. With `--tensorboard`, per-epoch metrics and TensorBoard HParams summaries are written below each architecture directory; point TensorBoard at the sweep root to compare trials.
+Architecture training is Lightning-backed. The repo still owns the search loop and artifact schema, while Lightning owns per-trial train/validation/test execution, deterministic seeding, progress, and TensorBoard logging. With `--tensorboard`, per-epoch metrics and TensorBoard HParams summaries are written below each architecture directory; point TensorBoard at the sweep root to compare trials by dataset, synth, network type, architecture shape, and loader settings.
 
 `search-feature-change-models` wraps this for public experiments. It discovers all `*/action_dataset/dataset.npz` files under `artifacts/`, writes a generated CNN/RNN-heavy `search_config.json`, runs each dataset, and emits:
 

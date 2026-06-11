@@ -218,8 +218,8 @@ class OfflineDatasetTests(unittest.TestCase):
                 plugin_path=Path("dummy.vst3"),
                 manifest_path=manifest_path,
                 output_dir=root,
-                max_states=2,
-                moves_per_start=1,
+                rows_to_generate=2,
+                moves_per_cycle=1,
                 preset_render_slowdown_threshold=0.0,
             )
             with patch("rl_synth_programmer.offline_dataset.SynthHost", FakeHost):
@@ -238,8 +238,8 @@ class OfflineDatasetTests(unittest.TestCase):
                 plugin_path=Path("dummy.vst3"),
                 manifest_path=manifest_path,
                 output_dir=root,
-                max_states=2,
-                moves_per_start=1,
+                rows_to_generate=2,
+                moves_per_cycle=1,
             )
             estimate = {
                 "estimated_total_renders": 10,
@@ -253,7 +253,7 @@ class OfflineDatasetTests(unittest.TestCase):
             with patch("rl_synth_programmer.offline_dataset.SynthHost", FakeHost):
                 with patch("rl_synth_programmer.offline_dataset.ParallelRenderPool", FakeRenderPool):
                     with patch("rl_synth_programmer.offline_dataset.build_embedder", return_value=FakeEmbedder()):
-                        result = generate_action_dataset(config, progress=False, yes=True, estimate=estimate)
+                        result = generate_action_dataset(config, progress=False, confirm_large_run=True, estimate=estimate)
             dataset = np.load(result["dataset_path"])
             self.assertEqual(dataset["observations"].shape, (2, 8))
             self.assertEqual(dataset["action_rewards"].shape, (2, 4))
@@ -276,8 +276,8 @@ class OfflineDatasetTests(unittest.TestCase):
                 plugin_path=Path("dummy.vst3"),
                 manifest_path=manifest_path,
                 output_dir=root,
-                max_states=1,
-                moves_per_start=1,
+                rows_to_generate=1,
+                moves_per_cycle=1,
                 calibration_probe_states=1,
                 preset_render_slowdown_threshold=0.0,
             )
@@ -293,7 +293,7 @@ class OfflineDatasetTests(unittest.TestCase):
             with patch("rl_synth_programmer.offline_dataset.SynthHost", FakeHost):
                 with patch("rl_synth_programmer.offline_dataset.ParallelRenderPool", SensitivityRenderPool):
                     with patch("rl_synth_programmer.offline_dataset.build_embedder", return_value=FakeEmbedder()):
-                        result = generate_action_dataset(config, progress=False, yes=True, estimate=estimate)
+                        result = generate_action_dataset(config, progress=False, confirm_large_run=True, estimate=estimate)
             metadata = json.loads(Path(result["metadata_path"]).read_text())
             cutoff_step = float(metadata["action_step_by_parameter"]["cutoff"])
             resonance_step = float(metadata["action_step_by_parameter"]["resonance"])
@@ -308,8 +308,8 @@ class OfflineDatasetTests(unittest.TestCase):
                 plugin_path=Path("dummy.vst3"),
                 manifest_path=manifest_path,
                 output_dir=root,
-                max_states=1,
-                moves_per_start=1,
+                rows_to_generate=1,
+                moves_per_cycle=1,
                 action_step=0.05,
                 action_step_calibration=False,
                 preset_render_slowdown_threshold=0.0,
@@ -326,7 +326,7 @@ class OfflineDatasetTests(unittest.TestCase):
             with patch("rl_synth_programmer.offline_dataset.SynthHost", FakeHost):
                 with patch("rl_synth_programmer.offline_dataset.ParallelRenderPool", FakeRenderPool):
                     with patch("rl_synth_programmer.offline_dataset.build_embedder", return_value=FakeEmbedder()):
-                        result = generate_action_dataset(config, progress=False, yes=True, estimate=estimate)
+                        result = generate_action_dataset(config, progress=False, confirm_large_run=True, estimate=estimate)
             metadata = json.loads(Path(result["metadata_path"]).read_text())
             self.assertEqual(metadata["action_step_mode"], "fixed")
             self.assertEqual(metadata["action_deltas"], [0.05, -0.05, 0.05, -0.05])
@@ -339,8 +339,8 @@ class OfflineDatasetTests(unittest.TestCase):
                 plugin_path=Path("dummy.vst3"),
                 manifest_path=manifest_path,
                 output_dir=root,
-                max_states=3,
-                moves_per_start=2,
+                rows_to_generate=3,
+                moves_per_cycle=2,
                 preset_render_slowdown_threshold=0.0,
             )
             estimate = {
@@ -355,13 +355,55 @@ class OfflineDatasetTests(unittest.TestCase):
             with patch("rl_synth_programmer.offline_dataset.SynthHost", FakeHost):
                 with patch("rl_synth_programmer.offline_dataset.ParallelRenderPool", FakeRenderPool):
                     with patch("rl_synth_programmer.offline_dataset.build_embedder", return_value=FakeEmbedder()):
-                        result = generate_action_dataset(config, progress=False, yes=True, estimate=estimate)
+                        result = generate_action_dataset(config, progress=False, confirm_large_run=True, estimate=estimate)
             dataset = np.load(result["dataset_path"])
-            self.assertEqual(dataset["target_indices"].tolist(), [0, 1, 0])
-            self.assertEqual(dataset["start_indices"].tolist(), [1, 0, 1])
-            self.assertEqual(dataset["move_indices"].tolist(), [0, 0, 1])
+            self.assertEqual(dataset["target_indices"].tolist(), [0, 0, 1])
+            self.assertEqual(dataset["start_indices"].tolist(), [1, 1, 0])
+            self.assertEqual(dataset["move_indices"].tolist(), [0, 1, 0])
             metadata = json.loads(Path(result["metadata_path"]).read_text())
-            self.assertEqual(metadata["sampling_scheme"], "round_robin_greedy")
+            self.assertEqual(metadata["sampling_scheme"], "cyclic_greedy")
+
+    def test_generate_action_dataset_resumes_pair_from_latest_state_on_later_cycle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest_path = _write_manifest(root)
+            config = ActionDatasetConfig(
+                plugin_path=Path("dummy.vst3"),
+                manifest_path=manifest_path,
+                output_dir=root,
+                rows_to_generate=5,
+                moves_per_cycle=1,
+                action_step=0.1,
+                action_step_calibration=False,
+                preset_render_slowdown_threshold=0.0,
+            )
+            estimate = {
+                "estimated_total_renders": 25,
+                "sample_states": 5,
+                "action_count": 4,
+                "observation_size": 8,
+                "seconds_per_state": 0.01,
+                "estimated_seconds": 0.05,
+                "estimated_npz_bytes": 100,
+            }
+            with patch("rl_synth_programmer.offline_dataset.SynthHost", FakeHost):
+                with patch("rl_synth_programmer.offline_dataset.ParallelRenderPool", FakeRenderPool):
+                    with patch("rl_synth_programmer.offline_dataset.build_embedder", return_value=FakeEmbedder()):
+                        result = generate_action_dataset(
+                            config,
+                            progress=False,
+                            confirm_large_run=True,
+                            estimate=estimate,
+                        )
+            dataset = np.load(result["dataset_path"])
+            self.assertEqual(dataset["target_indices"].tolist(), [0, 1, 0, 1, 0])
+            self.assertEqual(dataset["start_indices"].tolist(), [1, 0, 1, 0, 1])
+            self.assertEqual(dataset["move_indices"].tolist(), [0, 0, 1, 1, 2])
+
+            # Observation layout is [target_embedding, current_embedding, delta, params].
+            params = dataset["observations"][:, 6:8]
+            self.assertFalse(np.allclose(params[0], params[2]))
+            self.assertFalse(np.allclose(params[2], params[4]))
 
     def test_generate_action_dataset_marks_timed_out_actions_failed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -371,8 +413,8 @@ class OfflineDatasetTests(unittest.TestCase):
                 plugin_path=Path("dummy.vst3"),
                 manifest_path=manifest_path,
                 output_dir=root,
-                max_states=1,
-                moves_per_start=1,
+                rows_to_generate=1,
+                moves_per_cycle=1,
                 render_timeout_seconds=0.01,
                 render_chunk_size=1,
                 failed_action_reward=-123.0,
@@ -390,7 +432,7 @@ class OfflineDatasetTests(unittest.TestCase):
             with patch("rl_synth_programmer.offline_dataset.SynthHost", FakeHost):
                 with patch("rl_synth_programmer.offline_dataset.ParallelRenderPool", TimeoutRenderPool):
                     with patch("rl_synth_programmer.offline_dataset.build_embedder", return_value=FakeEmbedder()):
-                        result = generate_action_dataset(config, progress=False, yes=True, estimate=estimate)
+                        result = generate_action_dataset(config, progress=False, confirm_large_run=True, estimate=estimate)
             dataset = np.load(result["dataset_path"])
             self.assertEqual(float(dataset["action_rewards"][0, 0]), -123.0)
             self.assertEqual(int(dataset["failed_action_counts"][0]), 1)
@@ -405,8 +447,8 @@ class OfflineDatasetTests(unittest.TestCase):
                 plugin_path=Path("dummy.vst3"),
                 manifest_path=manifest_path,
                 output_dir=root,
-                max_states=1,
-                moves_per_start=1,
+                rows_to_generate=1,
+                moves_per_cycle=1,
                 render_chunk_size=1,
                 max_state_seconds=0.01,
                 failed_action_reward=-123.0,
@@ -424,7 +466,7 @@ class OfflineDatasetTests(unittest.TestCase):
             with patch("rl_synth_programmer.offline_dataset.SynthHost", FakeHost):
                 with patch("rl_synth_programmer.offline_dataset.ParallelRenderPool", SlowRenderPool):
                     with patch("rl_synth_programmer.offline_dataset.build_embedder", return_value=FakeEmbedder()):
-                        result = generate_action_dataset(config, progress=False, yes=True, estimate=estimate)
+                        result = generate_action_dataset(config, progress=False, confirm_large_run=True, estimate=estimate)
             dataset = np.load(result["dataset_path"])
             self.assertEqual(int(dataset["state_skipped"][0]), 1)
             self.assertGreater(int(dataset["failed_action_counts"][0]), 0)
@@ -439,8 +481,8 @@ class OfflineDatasetTests(unittest.TestCase):
                 plugin_path=Path("dummy.vst3"),
                 manifest_path=manifest_path,
                 output_dir=root,
-                max_states=2,
-                moves_per_start=1,
+                rows_to_generate=2,
+                moves_per_cycle=1,
                 shard_size=1,
                 reload_workers_every_renders=3,
                 preset_render_slowdown_threshold=0.0,
@@ -459,7 +501,7 @@ class OfflineDatasetTests(unittest.TestCase):
             with patch("rl_synth_programmer.offline_dataset.SynthHost", FakeHost):
                 with patch("rl_synth_programmer.offline_dataset.ParallelRenderPool", CountingRenderPool):
                     with patch("rl_synth_programmer.offline_dataset.build_embedder", return_value=FakeEmbedder()):
-                        result = generate_action_dataset(config, progress=False, yes=True, estimate=estimate)
+                        result = generate_action_dataset(config, progress=False, confirm_large_run=True, estimate=estimate)
             self.assertGreaterEqual(CountingRenderPool.opened, 2)
             self.assertEqual(CountingRenderPool.opened, CountingRenderPool.closed)
             metadata = json.loads(Path(result["metadata_path"]).read_text())
@@ -473,8 +515,8 @@ class OfflineDatasetTests(unittest.TestCase):
                 plugin_path=Path("dummy.vst3"),
                 manifest_path=manifest_path,
                 output_dir=root,
-                max_states=2,
-                moves_per_start=1,
+                rows_to_generate=2,
+                moves_per_cycle=1,
                 render_chunk_size=1,
                 preset_render_slowdown_threshold=1.1,
                 reload_workers_on_render_slowdown=False,
@@ -492,7 +534,7 @@ class OfflineDatasetTests(unittest.TestCase):
                 with patch("rl_synth_programmer.offline_dataset.ParallelRenderPool", SlowHighParamRenderPool):
                     with patch("rl_synth_programmer.offline_dataset.build_embedder", return_value=FakeEmbedder()):
                         with self.assertRaises(AssertionError) as ctx:
-                            generate_action_dataset(config, progress=False, yes=True, estimate=estimate)
+                            generate_action_dataset(config, progress=False, confirm_large_run=True, estimate=estimate)
             message = str(ctx.exception)
             self.assertIn("Preset render slowdown detected", message)
             self.assertIn("target=a", message)
@@ -506,17 +548,17 @@ class OfflineDatasetTests(unittest.TestCase):
                 plugin_path=Path("dummy.vst3"),
                 manifest_path=manifest_path,
                 output_dir=root,
-                max_states=2,
-                moves_per_start=1,
+                rows_to_generate=2,
+                moves_per_cycle=1,
             )
             with self.assertRaises(RuntimeError) as ctx:
                 generate_action_dataset(
                     config,
                     progress=False,
-                    yes=False,
+                    confirm_large_run=False,
                     estimate={"estimated_total_renders": 10001},
                 )
-            self.assertIn("--yes", str(ctx.exception))
+            self.assertIn("--confirm-large-run", str(ctx.exception))
             self.assertFalse((root / "action_dataset" / "dataset.npz").exists())
 
 

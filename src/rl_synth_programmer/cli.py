@@ -269,12 +269,21 @@ def _base_parser() -> argparse.ArgumentParser:
         default="clap",
         help="Reward source for action labels. Default: clap.",
     )
-    dataset_parser.add_argument("--max-states", type=int, default=256, help="Maximum dataset rows to generate. Default: 256.")
     dataset_parser.add_argument(
+        "--rows-to-generate",
+        "--max-states",
+        dest="rows_to_generate",
+        type=int,
+        default=256,
+        help="Dataset rows to generate. The old --max-states alias is accepted for compatibility. Default: 256.",
+    )
+    dataset_parser.add_argument(
+        "--moves-per-cycle",
         "--moves-per-start",
+        dest="moves_per_cycle",
         type=int,
         default=4,
-        help="Greedy best-action moves to take from each target/start pair. Default: 4.",
+        help="Greedy best-action moves to take from one target/start pair before cycling to the next. The old --moves-per-start alias is accepted for compatibility. Default: 4.",
     )
     dataset_parser.add_argument("--num-workers", type=int, default=1, help="Parallel render worker count. Default: 1.")
     dataset_parser.add_argument(
@@ -295,9 +304,11 @@ def _base_parser() -> argparse.ArgumentParser:
         help="Run one representative all-action evaluation and print cost estimates without writing dataset.npz.",
     )
     dataset_parser.add_argument(
+        "--confirm-large-run",
         "--yes",
+        dest="confirm_large_run",
         action="store_true",
-        help="Confirm generation when estimated render count is large.",
+        help="Confirm generation when the estimated render count is large. The old --yes alias is accepted for compatibility.",
     )
     dataset_parser.add_argument(
         "--render-timeout-seconds",
@@ -860,10 +871,10 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
         if not _is_positive_int(args.subset_limit):
             _argument_error(parser, "--subset-limit must be an integer >= 1.")
     elif args.command == "generate-action-dataset":
-        if not _is_positive_int(args.max_states):
-            _argument_error(parser, "--max-states must be an integer >= 1.")
-        if not _is_positive_int(args.moves_per_start):
-            _argument_error(parser, "--moves-per-start must be an integer >= 1.")
+        if not _is_positive_int(args.rows_to_generate):
+            _argument_error(parser, "--rows-to-generate must be an integer >= 1.")
+        if not _is_positive_int(args.moves_per_cycle):
+            _argument_error(parser, "--moves-per-cycle must be an integer >= 1.")
         if not _is_positive_int(args.num_workers):
             _argument_error(parser, "--num-workers must be an integer >= 1.")
         if not _is_positive_int(args.clap_batch_size):
@@ -1111,13 +1122,13 @@ def _cmd_generate_action_dataset(
     plugin_path: str,
     run_folder: str,
     reward_mode: str,
-    max_states: int,
-    moves_per_start: int,
+    rows_to_generate: int,
+    moves_per_cycle: int,
     num_workers: int,
     clap_batch_size: int,
     clap_device: str,
     estimate_only: bool,
-    yes: bool,
+    confirm_large_run: bool,
     progress: bool,
     render_timeout_seconds: float,
     skip_failed_actions: bool,
@@ -1141,8 +1152,8 @@ def _cmd_generate_action_dataset(
         manifest_path=manifest_path,
         output_dir=run_root,
         reward_mode=reward_mode,
-        max_states=max_states,
-        moves_per_start=moves_per_start,
+        rows_to_generate=rows_to_generate,
+        moves_per_cycle=moves_per_cycle,
         num_workers=num_workers,
         clap_batch_size=clap_batch_size,
         clap_device=clap_device,
@@ -1165,7 +1176,7 @@ def _cmd_generate_action_dataset(
     if estimate_only:
         print(json.dumps({"run_folder": str(run_root), "estimate": estimate}, indent=2))
         return
-    result = generate_action_dataset(config, progress=progress, yes=yes, estimate=estimate)
+    result = generate_action_dataset(config, progress=progress, confirm_large_run=confirm_large_run, estimate=estimate)
     print(json.dumps(result, indent=2))
 
 
@@ -1276,13 +1287,13 @@ def main() -> None:
                 args.plugin,
                 args.run_folder,
                 args.reward_mode,
-                args.max_states,
-                args.moves_per_start,
+                args.rows_to_generate,
+                args.moves_per_cycle,
                 args.num_workers,
                 args.clap_batch_size,
                 args.clap_device,
                 args.estimate_only,
-                args.yes,
+                args.confirm_large_run,
                 args.progress,
                 args.render_timeout_seconds,
                 args.skip_failed_actions,

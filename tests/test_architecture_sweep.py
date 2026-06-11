@@ -14,7 +14,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from rl_synth_programmer.architecture_sweep import _prepare_supervised_arrays, compare_architectures, load_sweep_config
+from rl_synth_programmer.architecture_sweep import _prepare_supervised_arrays, _tensorboard_hparams, compare_architectures, load_sweep_config
 
 
 class ArchitectureSweepTests(unittest.TestCase):
@@ -39,6 +39,43 @@ class ArchitectureSweepTests(unittest.TestCase):
             )
             with self.assertRaises(ValueError):
                 load_sweep_config(path)
+
+    def test_tensorboard_hparams_include_dataset_and_architecture_shape(self) -> None:
+        hparams = _tensorboard_hparams(
+            {
+                "name": "cnn-wide-s7",
+                "type": "cnn1d",
+                "channels": [32, 64],
+                "kernel_sizes": [7, 5],
+                "embedding_hidden_size": 128,
+                "param_hidden_sizes": [64],
+                "head_hidden_sizes": [128, 64],
+                "learning_rate": 0.001,
+                "batch_size": 64,
+                "epochs": 5,
+                "seed": 7,
+                "dropout": 0.1,
+                "num_workers": 2,
+            },
+            cv_folds=3,
+            context={
+                "dataset_name": "dexed_real",
+                "synth": "Dexed",
+                "target": "action_reward_as_feature_change_proxy",
+                "row_count": 1024,
+                "action_count": 312,
+                "param_count": 156,
+            },
+        )
+        self.assertEqual(hparams["dataset_name"], "dexed_real")
+        self.assertEqual(hparams["synth"], "Dexed")
+        self.assertEqual(hparams["architecture_type"], "cnn1d")
+        self.assertEqual(hparams["conv_layer_count"], 2)
+        self.assertEqual(hparams["conv_max_channels"], 64)
+        self.assertEqual(hparams["head_hidden_layer_count"], 2)
+        self.assertEqual(hparams["head_hidden_total_units"], 192)
+        self.assertEqual(hparams["num_workers"], 2)
+        self.assertEqual(hparams["cv_folds"], 3)
 
     def test_compare_architectures_writes_ranked_leaderboard(self) -> None:
         if importlib.util.find_spec("torch") is None:
