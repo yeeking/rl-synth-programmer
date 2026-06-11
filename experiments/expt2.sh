@@ -1,3 +1,8 @@
+rl-synth generate-target-set --plugin "./plugins/Dexed.vst3" --run-folder artifacts/larger-data/dexed --subset-limit 128 
+rl-synth generate-target-set --plugin "./plugins/Ultramaster KR-106.vst3" --run-folder artifacts/larger-data/ultra --subset-limit 128 
+
+
+
 rl-synth generate-action-dataset \
   --plugin "./plugins/Ultramaster KR-106.vst3" \
   --run-folder ./artefacts/larger-data/ultra \
