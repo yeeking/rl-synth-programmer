@@ -5,7 +5,7 @@ rl-synth generate-target-set --plugin "./plugins/Ultramaster KR-106.vst3" --run-
 
 rl-synth generate-action-dataset \
   --plugin "./plugins/Ultramaster KR-106.vst3" \
-  --run-folder ./artefacts/larger-data/ultra \
+  --run-folder ./artifacts/larger-data/ultra \
   --rows-to-generate 1048576 \
   --moves-per-cycle 20 \
   --num-workers 20 \
@@ -20,7 +20,7 @@ rl-synth generate-action-dataset \
 
 rl-synth generate-action-dataset \
   --plugin "./plugins/Dexed.vst3" \
-  --run-folder ./artefacts/larger-data/dexed \
+  --run-folder ./artifacts/larger-data/dexed \
   --rows-to-generate 1048576 \
   --moves-per-cycle 20 \
   --num-workers 20 \
@@ -33,7 +33,7 @@ rl-synth generate-action-dataset \
   --confirm-large-run
 
 
-SEARCH_DIR=artifacts/artefacts/larger-data/search
+SEARCH_DIR=artifacts/larger-data/search
 SWEEP_CONFIG="$SEARCH_DIR/full_sweep_config.json"
 mkdir -p "$SEARCH_DIR"
 
@@ -189,8 +189,8 @@ print(f"Wrote {config_path} with {len(architectures)} architecture specs.")
 PY
 
 rl-synth search-feature-change-models \
-  --dataset artifacts/artefacts/larger-data/ultra/action_dataset/dataset.npz \
-  --dataset artifacts/artefacts/larger-data/dexed/action_dataset/dataset.npz \
+  --dataset artifacts/larger-data/ultra/action_dataset/dataset.npz \
+  --dataset artifacts/larger-data/dexed/action_dataset/dataset.npz \
   --config "$SWEEP_CONFIG" \
   --out-dir "$SEARCH_DIR/full_hparam_sweep" \
   --tensorboard \
