@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 
 @dataclass(slots=True)
 class SynthHostConfig:
     plugin_path: Path
+    host_backend: Literal["pedalboard", "renderking"] = "pedalboard"
     sample_rate: int = 44_100
     note: int = 60
     velocity: int = 100

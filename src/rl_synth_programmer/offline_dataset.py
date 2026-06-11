@@ -10,13 +10,19 @@ import numpy as np
 
 from .config import CurriculumConfig, RewardConfig, SynthEnvConfig, SynthHostConfig
 from .curriculum import TargetSpec
-from .host import SynthHost
+from .host import RenderKingSynthHost, SynthHost
 from .logging_utils import make_progress_bar, stage_log
 from .manifest import write_json
 from .parallel_rollout import BatchedRolloutCoordinator, ParallelRenderPool, RenderRequest, embed_audio_batch
 from .reward import build_embedder
 
 LARGE_RENDER_WARNING_THRESHOLD = 10_000
+
+
+def make_synth_host(config: SynthHostConfig):
+    if str(getattr(config, "host_backend", "pedalboard")) == "renderking":
+        return RenderKingSynthHost(config)
+    return SynthHost(config)
 
 
 @dataclass(slots=True)
@@ -26,6 +32,7 @@ class ActionDatasetConfig:
     plugin_path: VST3 instrument plugin used for rendering candidate synth states.
     manifest_path: target manifest produced by generate-target-set.
     output_dir: run folder where action_dataset/ artifacts are written.
+    host_backend: synth render backend, either pedalboard or renderking.
     reward_mode: reward backend; v1 supports CLAP-backed distance rewards.
     rows_to_generate: target number of dataset rows to write. Each row is one current synth
         state plus dense labels for every available +/- parameter action. Generation keeps
@@ -57,6 +64,7 @@ class ActionDatasetConfig:
     plugin_path: Path
     manifest_path: Path
     output_dir: Path
+    host_backend: str = "pedalboard"
     reward_mode: str = "clap"
     rows_to_generate: int = 256
     moves_per_cycle: int = 4
@@ -130,7 +138,7 @@ def _sample_state_count(config: ActionDatasetConfig, pairs: list[tuple[int, int]
 def _build_config(config: ActionDatasetConfig) -> tuple[SynthEnvConfig, CurriculumConfig]:
     reward = RewardConfig(mode=config.reward_mode, clap_device=config.clap_device)
     env = SynthEnvConfig(
-        host=SynthHostConfig(plugin_path=config.plugin_path),
+        host=SynthHostConfig(plugin_path=config.plugin_path, host_backend=config.host_backend),
         reward=reward,
         action_step=float(config.action_step),
         target_mode="preset_manifest",
@@ -514,7 +522,7 @@ def estimate_action_dataset(config: ActionDatasetConfig, *, progress: bool = Tru
     assert config.moves_per_cycle >= 1, f"moves_per_cycle must be >= 1, got {config.moves_per_cycle}"
     env_config, curriculum_config = _build_config(config)
     stage_log("Loading host and manifest for dataset estimate.")
-    probe_host = SynthHost(env_config.host)
+    probe_host = make_synth_host(env_config.host)
     parameter_specs = probe_host.filter_parameters()
     coordinator = BatchedRolloutCoordinator(env_config, curriculum_config, parameter_specs)
     targets = coordinator.curriculum.all_targets()
@@ -589,6 +597,7 @@ def estimate_action_dataset(config: ActionDatasetConfig, *, progress: bool = Tru
         "num_workers": int(config.num_workers),
         "clap_batch_size": int(config.clap_batch_size),
         "clap_device": str(config.clap_device),
+        "host_backend": str(config.host_backend),
         "resolved_clap_device": str(getattr(embedder, "device", config.clap_device)),
         "render_timeout_seconds": config.render_timeout_seconds,
         "max_state_seconds": config.max_state_seconds,
@@ -756,7 +765,7 @@ def generate_action_dataset(
 
     env_config, curriculum_config = _build_config(config)
     stage_log("Loading host, manifest, and embedder for action dataset generation.")
-    probe_host = SynthHost(env_config.host)
+    probe_host = make_synth_host(env_config.host)
     parameter_specs = probe_host.filter_parameters()
     coordinator = BatchedRolloutCoordinator(env_config, curriculum_config, parameter_specs)
     embedder = build_embedder(env_config.reward)
@@ -999,6 +1008,7 @@ def generate_action_dataset(
         "plugin_path": str(config.plugin_path),
         "manifest_path": str(config.manifest_path),
         "reward_mode": config.reward_mode,
+        "host_backend": str(config.host_backend),
         "clap_device": str(config.clap_device),
         "resolved_clap_device": str(getattr(embedder, "device", config.clap_device)),
         "action_step": float(config.action_step),
@@ -1029,6 +1039,7 @@ def generate_action_dataset(
             "num_workers": int(config.num_workers),
             "clap_batch_size": int(config.clap_batch_size),
             "clap_device": str(config.clap_device),
+            "host_backend": str(config.host_backend),
             "seed": int(config.seed),
             "render_timeout_seconds": config.render_timeout_seconds,
             "skip_failed_actions": bool(config.skip_failed_actions),

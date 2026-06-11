@@ -9,7 +9,7 @@ import numpy as np
 from .config import CurriculumConfig, DQNConfig, ExperimentConfig, RewardConfig, SynthEnvConfig, SynthHostConfig
 from .curriculum import TargetSpec
 from .env import make_env
-from .host import SynthHost
+from .host import make_synth_host
 from .logging_utils import make_progress_bar, progress_iter, stage_log
 from .manifest import append_csv, target_record, write_json
 from .reward import CLAPEmbedder, CLAP_WEIGHTS_DIR, SimilarityRewardModel
@@ -139,8 +139,8 @@ def _clap_summary(manifest: dict[str, Any], *, progress: bool = True) -> dict[st
     }
 
 
-def inspect_plugin(plugin_path: Path, artifacts_dir: Path) -> dict[str, Any]:
-    host = SynthHost(SynthHostConfig(plugin_path=plugin_path))
+def inspect_plugin(plugin_path: Path, artifacts_dir: Path, *, host_backend: str = "pedalboard") -> dict[str, Any]:
+    host = make_synth_host(SynthHostConfig(plugin_path=plugin_path, host_backend=host_backend))
     metadata = host.inspect_plugin()
     metadata["parameters"] = [
         {
@@ -170,12 +170,14 @@ def generate_target_set(
     note: int = 60,
     duration: float = 1.0,
     *,
+    host_backend: str = "pedalboard",
     progress: bool = True,
 ) -> dict[str, Any]:
     stage_log(f"Discovering preset/program states from {plugin_path}.")
-    capture_host = SynthHost(
+    capture_host = make_synth_host(
         SynthHostConfig(
             plugin_path=plugin_path,
+            host_backend=host_backend,
             sample_rate=sample_rate,
             note=note,
             render_duration=duration,
@@ -196,9 +198,10 @@ def generate_target_set(
         state_hash = item["state_hash"]
         state_path = states_dir / f"{item['target_id']}.bin"
         state_path.write_bytes(state_bytes)
-        render_host = SynthHost(
+        render_host = make_synth_host(
             SynthHostConfig(
                 plugin_path=plugin_path,
+                host_backend=host_backend,
                 sample_rate=sample_rate,
                 note=note,
                 render_duration=duration,
@@ -231,6 +234,7 @@ def generate_target_set(
     render_progress.close()
     manifest = {
         "plugin_path": str(plugin_path),
+        "host_backend": str(host_backend),
         "sample_rate": sample_rate,
         "note": note,
         "duration": duration,
@@ -264,8 +268,9 @@ def _experiment_from_manifest(
     artifacts_dir: Path,
     manifest_path: Path,
     reward_mode: str,
+    host_backend: str = "pedalboard",
 ) -> ExperimentConfig:
-    host = SynthHostConfig(plugin_path=plugin_path)
+    host = SynthHostConfig(plugin_path=plugin_path, host_backend=host_backend)
     reward = _offline_reward_config(reward_mode)
     env = SynthEnvConfig(
         host=host,
@@ -286,11 +291,12 @@ def smoke_random_env(
     manifest_path: Path,
     episodes: int = 4,
     *,
+    host_backend: str = "pedalboard",
     progress: bool = True,
     episode_log_interval: int = 1,
 ) -> dict[str, Any]:
     stage_log(f"Running random-environment smoke with manifest {manifest_path}.")
-    config = _experiment_from_manifest(plugin_path, artifacts_dir, manifest_path, reward_mode="random")
+    config = _experiment_from_manifest(plugin_path, artifacts_dir, manifest_path, reward_mode="random", host_backend=host_backend)
     env = make_env(config.env, config.curriculum)
     metrics = run_random_policy(env, episodes=episodes, progress=progress, episode_log_interval=episode_log_interval)
     episode_rows = [asdict(metric) for metric in metrics]
@@ -310,6 +316,7 @@ def smoke_train_clap(
     manifest_path: Path,
     steps: int = 128,
     *,
+    host_backend: str = "pedalboard",
     progress: bool = True,
     log_interval: int = 10,
     episode_log_interval: int = 1,
@@ -321,7 +328,7 @@ def smoke_train_clap(
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
     stage_log(f"Running CLAP smoke training with manifest {manifest_path}.")
-    config = _experiment_from_manifest(plugin_path, artifacts_dir, manifest_path, reward_mode="clap")
+    config = _experiment_from_manifest(plugin_path, artifacts_dir, manifest_path, reward_mode="clap", host_backend=host_backend)
     tb_dir = tensorboard_dir or artifacts_dir / "tensorboard"
     agent, logs = train_dqn(
         config,
@@ -363,6 +370,7 @@ def smoke_evaluate(
     checkpoint: Path,
     episodes: int = 3,
     *,
+    host_backend: str = "pedalboard",
     progress: bool = True,
     episode_log_interval: int = 1,
     tensorboard: bool = True,
@@ -373,7 +381,7 @@ def smoke_evaluate(
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
     stage_log(f"Running smoke evaluation with checkpoint {checkpoint}.")
-    config = _experiment_from_manifest(plugin_path, artifacts_dir, manifest_path, reward_mode="clap")
+    config = _experiment_from_manifest(plugin_path, artifacts_dir, manifest_path, reward_mode="clap", host_backend=host_backend)
     tb_dir = tensorboard_dir or artifacts_dir / "tensorboard"
     metrics = evaluate_dqn(
         config,
@@ -408,10 +416,11 @@ def full_smoke_run(
     episode_log_interval: int = 1,
     tensorboard: bool = True,
     tensorboard_dir: Path | None = None,
+    host_backend: str = "pedalboard",
 ) -> dict[str, Any]:
     stage_log(f"Starting full smoke run in {artifacts_dir}.")
-    inspect = inspect_plugin(plugin_path, artifacts_dir)
-    generated = generate_target_set(plugin_path, artifacts_dir, subset_limit=subset_limit, progress=progress)
+    inspect = inspect_plugin(plugin_path, artifacts_dir, host_backend=host_backend)
+    generated = generate_target_set(plugin_path, artifacts_dir, subset_limit=subset_limit, host_backend=host_backend, progress=progress)
     manifest_path = Path(generated["manifest_path"])
     import json
 
@@ -427,6 +436,7 @@ def full_smoke_run(
         artifacts_dir,
         manifest_path,
         episodes=random_episodes,
+        host_backend=host_backend,
         progress=progress,
         episode_log_interval=episode_log_interval,
     )
@@ -436,6 +446,7 @@ def full_smoke_run(
         artifacts_dir,
         manifest_path,
         steps=train_steps,
+        host_backend=host_backend,
         progress=progress,
         log_interval=log_interval,
         episode_log_interval=episode_log_interval,
@@ -448,6 +459,7 @@ def full_smoke_run(
         manifest_path,
         Path(train_payload["checkpoint"]),
         episodes=eval_episodes,
+        host_backend=host_backend,
         progress=progress,
         episode_log_interval=episode_log_interval,
         tensorboard=tensorboard,

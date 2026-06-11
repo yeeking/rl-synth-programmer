@@ -11,10 +11,10 @@ import numpy as np
 
 from .config import CurriculumConfig, RewardConfig, SynthEnvConfig, SynthHostConfig
 from .curriculum import TargetPool, TargetSpec
-from .host import ParameterSpec, SynthHost, nudge_parameter_values
+from .host import ParameterSpec, make_synth_host, nudge_parameter_values
 from .reward import AudioEmbedder, RandomRewardModel, SimilarityRewardModel
 
-_WORKER_HOST: SynthHost | None = None
+_WORKER_HOST = None
 
 
 @dataclass(slots=True)
@@ -70,7 +70,7 @@ class BatchedStepResult:
 
 def _render_worker_init(host_config: SynthHostConfig) -> None:
     global _WORKER_HOST
-    _WORKER_HOST = SynthHost(host_config)
+    _WORKER_HOST = make_synth_host(host_config)
     _WORKER_HOST.load()
 
 

@@ -18,7 +18,7 @@ from .hyperparameter_search import (
     discover_action_datasets,
     run_feature_change_search,
 )
-from .host import SynthHost
+from .host import make_synth_host
 from .offline_dataset import ActionDatasetConfig, estimate_action_dataset, generate_action_dataset
 from .smoke import full_smoke_run, generate_target_set, inspect_plugin, smoke_evaluate, smoke_random_env, smoke_train_clap
 from .training import evaluate_dqn, run_random_policy, train_dqn, train_dqn_batched
@@ -38,6 +38,14 @@ def _base_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    def add_host_backend(parser_: argparse.ArgumentParser) -> None:
+        parser_.add_argument(
+            "--host-backend",
+            choices=("pedalboard", "renderking"),
+            default="pedalboard",
+            help="Synth rendering backend. 'renderking' uses the experimental native VST3 host. Default: pedalboard.",
+        )
+
     inspect_parser = subparsers.add_parser("inspect-plugin", help="Load a plugin and print metadata.")
     inspect_parser.add_argument(
         "--plugin",
@@ -49,6 +57,7 @@ def _base_parser() -> argparse.ArgumentParser:
         default="inspect",
         help="Artifact root for this run. Output is always written under artifacts/<name>. The directory is created automatically. Default: inspect.",
     )
+    add_host_backend(inspect_parser)
 
     render_parser = subparsers.add_parser("render", help="Render one note from a plugin.")
     render_parser.add_argument(
@@ -68,6 +77,7 @@ def _base_parser() -> argparse.ArgumentParser:
         default=1.0,
         help="Rendered note length in seconds, excluding any configured tail. Expected range: > 0. Default: 1.0.",
     )
+    add_host_backend(render_parser)
 
     random_parser = subparsers.add_parser("random-agent", help="Run a random agent in the environment.")
     random_parser.add_argument(
@@ -98,6 +108,7 @@ def _base_parser() -> argparse.ArgumentParser:
         default=1,
         help="Print one episode summary every N completed episodes. Expected range: integer >= 1. Default: 1.",
     )
+    add_host_backend(random_parser)
 
     train_parser = subparsers.add_parser("train-dqn", help="Train the DQN agent against a generated target set.")
     train_parser.add_argument(
@@ -187,6 +198,7 @@ def _base_parser() -> argparse.ArgumentParser:
         default=None,
         help="Maximum actions allowed within one episode before truncation. Expected range: integer >= 1. If omitted, the config default is used.",
     )
+    add_host_backend(train_parser)
 
     eval_parser = subparsers.add_parser("evaluate", help="Evaluate the latest DQN checkpoint from a run folder.")
     eval_parser.add_argument(
@@ -228,6 +240,7 @@ def _base_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional TensorBoard subdirectory under artifacts/. If omitted, defaults to <run-folder>/train_dqn/tensorboard.",
     )
+    add_host_backend(eval_parser)
 
     target_parser = subparsers.add_parser("generate-target-set", help="Generate preset-derived target audio and manifest files.")
     target_parser.add_argument(
@@ -252,6 +265,7 @@ def _base_parser() -> argparse.ArgumentParser:
         default=True,
         help="Enable live progress output while rendering target presets. Use --no-progress for quieter output. Default: enabled.",
     )
+    add_host_backend(target_parser)
 
     dataset_parser = subparsers.add_parser(
         "generate-action-dataset",
@@ -269,6 +283,7 @@ def _base_parser() -> argparse.ArgumentParser:
         default="clap",
         help="Reward source for action labels. Default: clap.",
     )
+    add_host_backend(dataset_parser)
     dataset_parser.add_argument(
         "--rows-to-generate",
         "--max-states",
@@ -509,6 +524,7 @@ def _base_parser() -> argparse.ArgumentParser:
         default=1,
         help="Print one smoke-episode summary every N episodes. Expected range: integer >= 1. Default: 1.",
     )
+    add_host_backend(smoke_random_parser)
 
     smoke_train_parser = subparsers.add_parser("smoke-train-clap", help="Run CLAP-backed smoke training.")
     smoke_train_parser.add_argument(
@@ -556,6 +572,7 @@ def _base_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional TensorBoard subdirectory under artifacts/. If omitted, defaults to <run-folder>/smoke_train_clap/tensorboard.",
     )
+    add_host_backend(smoke_train_parser)
 
     smoke_eval_parser = subparsers.add_parser("smoke-evaluate", help="Run held-out evaluation for a smoke checkpoint.")
     smoke_eval_parser.add_argument(
@@ -597,6 +614,7 @@ def _base_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional TensorBoard subdirectory under artifacts/. If omitted, defaults to <run-folder>/smoke_train_clap/tensorboard.",
     )
+    add_host_backend(smoke_eval_parser)
 
     full_smoke_parser = subparsers.add_parser("full-smoke", help="Run the full end-to-end real-plugin smoke workflow.")
     full_smoke_parser.add_argument(
@@ -662,6 +680,7 @@ def _base_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional TensorBoard subdirectory under artifacts/. If omitted, defaults to <run-folder>/tensorboard.",
     )
+    add_host_backend(full_smoke_parser)
     return parser
 
 
@@ -963,6 +982,7 @@ def _experiment_config(
     manifest_path: Path | None = None,
     artifacts_dir: Path | None = None,
     run_name: str = "default",
+    host_backend: str = "pedalboard",
     num_workers: int = 1,
     updates_per_tick: int = 1,
     clap_batch_size: int | None = None,
@@ -972,7 +992,7 @@ def _experiment_config(
     max_episode_steps: int | None = None,
 ) -> ExperimentConfig:
     artifact_root = artifacts_dir or ARTIFACTS_ROOT / "default"
-    host = SynthHostConfig(plugin_path=Path(plugin_path))
+    host = SynthHostConfig(plugin_path=Path(plugin_path), host_backend=host_backend)
     reward = RewardConfig(mode=reward_mode, clap_device=clap_device)
     env = SynthEnvConfig(
         host=host,
@@ -1001,14 +1021,14 @@ def _experiment_config(
     )
 
 
-def _cmd_inspect(plugin_path: str, run_folder: str) -> None:
+def _cmd_inspect(plugin_path: str, run_folder: str, host_backend: str) -> None:
     run_root = _resolve_run_folder(run_folder, create=True)
-    payload = inspect_plugin(Path(plugin_path), run_root)
+    payload = inspect_plugin(Path(plugin_path), run_root, host_backend=host_backend)
     print(json.dumps(payload, indent=2))
 
 
-def _cmd_render(plugin_path: str, note: int, duration: float) -> None:
-    host = SynthHost(SynthHostConfig(plugin_path=Path(plugin_path), note=note, render_duration=duration))
+def _cmd_render(plugin_path: str, note: int, duration: float, host_backend: str) -> None:
+    host = make_synth_host(SynthHostConfig(plugin_path=Path(plugin_path), host_backend=host_backend, note=note, render_duration=duration))
     audio = host.render_note()
     summary = {
         "num_samples": int(audio.shape[0]),
@@ -1019,12 +1039,12 @@ def _cmd_render(plugin_path: str, note: int, duration: float) -> None:
     print(json.dumps(summary, indent=2))
 
 
-def _cmd_random_agent(plugin_path: str, episodes: int, run_folder: str | None, progress: bool, episode_log_interval: int) -> None:
+def _cmd_random_agent(plugin_path: str, episodes: int, run_folder: str | None, progress: bool, episode_log_interval: int, host_backend: str) -> None:
     manifest_path = None
     if run_folder is not None:
         run_root = _resolve_run_folder(run_folder, create=False)
         manifest_path = _find_manifest(run_root)
-    config = _experiment_config(plugin_path, reward_mode="random", manifest_path=manifest_path)
+    config = _experiment_config(plugin_path, reward_mode="random", manifest_path=manifest_path, host_backend=host_backend)
     env = make_env(config.env, config.curriculum)
     metrics = run_random_policy(env, episodes=episodes, progress=progress, episode_log_interval=episode_log_interval)
     print(json.dumps([asdict(metric) for metric in metrics], indent=2))
@@ -1044,6 +1064,7 @@ def _cmd_train_dqn(
     updates_per_tick: int,
     clap_batch_size: int | None,
     clap_device: str,
+    host_backend: str,
     epsilon_decay_steps: int | None,
     max_episode_steps: int | None,
 ) -> None:
@@ -1061,6 +1082,7 @@ def _cmd_train_dqn(
         updates_per_tick=updates_per_tick,
         clap_batch_size=clap_batch_size,
         clap_device=clap_device,
+        host_backend=host_backend,
         epsilon_decay_steps=epsilon_decay_steps,
         max_episode_steps=max_episode_steps,
     )
@@ -1101,11 +1123,18 @@ def _cmd_evaluate(
     episode_log_interval: int,
     tensorboard: bool,
     tensorboard_dir: str | None,
+    host_backend: str,
 ) -> None:
     run_root = _resolve_run_folder(run_folder, create=False)
     manifest_path = _find_manifest(run_root)
     checkpoint_path = _find_train_checkpoint(run_root)
-    config = _experiment_config(plugin_path, reward_mode="clap", manifest_path=manifest_path, artifacts_dir=run_root / TRAIN_DIR_NAME)
+    config = _experiment_config(
+        plugin_path,
+        reward_mode="clap",
+        manifest_path=manifest_path,
+        artifacts_dir=run_root / TRAIN_DIR_NAME,
+        host_backend=host_backend,
+    )
     metrics = evaluate_dqn(
         config,
         checkpoint=checkpoint_path,
@@ -1122,6 +1151,7 @@ def _cmd_generate_action_dataset(
     plugin_path: str,
     run_folder: str,
     reward_mode: str,
+    host_backend: str,
     rows_to_generate: int,
     moves_per_cycle: int,
     num_workers: int,
@@ -1151,6 +1181,7 @@ def _cmd_generate_action_dataset(
         plugin_path=Path(plugin_path),
         manifest_path=manifest_path,
         output_dir=run_root,
+        host_backend=host_backend,
         reward_mode=reward_mode,
         rows_to_generate=rows_to_generate,
         moves_per_cycle=moves_per_cycle,
@@ -1236,11 +1267,11 @@ def main() -> None:
     _validate_args(parser, args)
     try:
         if args.command == "inspect-plugin":
-            _cmd_inspect(args.plugin, args.run_folder)
+            _cmd_inspect(args.plugin, args.run_folder, args.host_backend)
         elif args.command == "render":
-            _cmd_render(args.plugin, args.note, args.duration)
+            _cmd_render(args.plugin, args.note, args.duration, args.host_backend)
         elif args.command == "random-agent":
-            _cmd_random_agent(args.plugin, args.episodes, args.run_folder, args.progress, args.episode_log_interval)
+            _cmd_random_agent(args.plugin, args.episodes, args.run_folder, args.progress, args.episode_log_interval, args.host_backend)
         elif args.command == "train-dqn":
             _cmd_train_dqn(
                 args.plugin,
@@ -1256,6 +1287,7 @@ def main() -> None:
                 args.updates_per_tick,
                 args.clap_batch_size,
                 args.clap_device,
+                args.host_backend,
                 args.epsilon_decay_steps,
                 args.max_episode_steps,
             )
@@ -1268,6 +1300,7 @@ def main() -> None:
                 args.episode_log_interval,
                 args.tensorboard,
                 args.tensorboard_dir,
+                args.host_backend,
             )
         elif args.command == "generate-target-set":
             run_root = _resolve_run_folder(args.run_folder, create=True)
@@ -1277,6 +1310,7 @@ def main() -> None:
                         Path(args.plugin),
                         run_root,
                         subset_limit=args.subset_limit,
+                        host_backend=args.host_backend,
                         progress=args.progress,
                     ),
                     indent=2,
@@ -1287,6 +1321,7 @@ def main() -> None:
                 args.plugin,
                 args.run_folder,
                 args.reward_mode,
+                args.host_backend,
                 args.rows_to_generate,
                 args.moves_per_cycle,
                 args.num_workers,
@@ -1339,6 +1374,7 @@ def main() -> None:
                         run_root,
                         _find_manifest(run_root),
                         episodes=args.episodes,
+                        host_backend=args.host_backend,
                         progress=args.progress,
                         episode_log_interval=args.episode_log_interval,
                     ),
@@ -1354,6 +1390,7 @@ def main() -> None:
                         run_root,
                         _find_manifest(run_root),
                         steps=args.steps,
+                        host_backend=args.host_backend,
                         progress=args.progress,
                         log_interval=args.log_interval,
                         episode_log_interval=args.episode_log_interval,
@@ -1373,6 +1410,7 @@ def main() -> None:
                         _find_manifest(run_root),
                         _find_smoke_checkpoint(run_root),
                         episodes=args.episodes,
+                        host_backend=args.host_backend,
                         progress=args.progress,
                         episode_log_interval=args.episode_log_interval,
                         tensorboard=args.tensorboard,
@@ -1397,6 +1435,7 @@ def main() -> None:
                         episode_log_interval=args.episode_log_interval,
                         tensorboard=args.tensorboard,
                         tensorboard_dir=_resolve_tensorboard_dir(run_root, "full-smoke", args.tensorboard_dir),
+                        host_backend=args.host_backend,
                     ),
                     indent=2,
                 )

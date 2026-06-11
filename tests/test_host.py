@@ -10,7 +10,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from rl_synth_programmer.config import SynthHostConfig
-from rl_synth_programmer.host import ParameterSpec, SynthHost
+from rl_synth_programmer.host import ParameterSpec, RenderKingSynthHost, SynthHost, make_synth_host
 
 
 class HostFilterTests(unittest.TestCase):
@@ -31,6 +31,23 @@ class HostFilterTests(unittest.TestCase):
         specs = [ParameterSpec("gain", "Gain", 0, 5.0, minimum=0.0, maximum=10.0)]
         defaults = host.get_normalized_defaults(specs)
         self.assertAlmostEqual(defaults["gain"], 0.5)
+
+    def test_host_factory_defaults_to_pedalboard_backend(self):
+        host = make_synth_host(SynthHostConfig(plugin_path=Path("dummy.vst3")))
+        self.assertIsInstance(host, SynthHost)
+
+    def test_host_factory_selects_renderking_backend(self):
+        host = make_synth_host(SynthHostConfig(plugin_path=Path("dummy.vst3"), host_backend="renderking"))
+        self.assertIsInstance(host, RenderKingSynthHost)
+
+    def test_renderking_backend_reports_missing_native_module_helpfully(self):
+        host = RenderKingSynthHost(SynthHostConfig(plugin_path=Path("dummy.vst3"), host_backend="renderking"))
+        try:
+            host._module()
+        except RuntimeError as exc:
+            self.assertIn("not importable", str(exc))
+        else:
+            self.skipTest("RenderKing native module is available in this environment.")
 
 
 if __name__ == "__main__":

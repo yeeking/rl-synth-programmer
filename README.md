@@ -26,6 +26,29 @@ export RUN_FOLDER="artifacts/my_synth_run"
 
 CLAP weights and text-model files are cached under `clap-weights/`. The code checks that local cache first and downloads missing assets from Hugging Face when CLAP is used. CLAP embedding uses `--clap-device auto` by default, selecting CUDA when `torch.cuda.is_available()` is true and falling back to CPU otherwise. For offline-only smoke runs, make sure the cache already contains `CLAP_weights_2023.pth` and the required text model directory, such as `clap-weights/gpt2/`.
 
+## RenderKing Backend
+
+Pedalboard remains the default render backend. The experimental native C++/JUCE backend, RenderKing, can be built into the active venv and selected with `--host-backend renderking`:
+
+```bash
+.venv/bin/pip install -e .[native]
+cmake -S native/renderking -B build/renderking \
+  -DPython_EXECUTABLE="$PWD/.venv/bin/python" \
+  -Dpybind11_DIR="$(.venv/bin/python -m pybind11 --cmakedir)" \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build build/renderking --config Release -j2
+```
+
+Then use it on render-heavy commands:
+
+```bash
+rl-synth render --plugin "$SYNTH_PLUGIN" --host-backend renderking
+rl-synth generate-target-set --plugin "$SYNTH_PLUGIN" --run-folder "$RUN_FOLDER" --host-backend renderking
+rl-synth generate-action-dataset --plugin "$SYNTH_PLUGIN" --run-folder "$RUN_FOLDER" --host-backend renderking
+```
+
+If RenderKing is requested before the native module is built, the CLI exits with build instructions. RenderKing is Linux/VST3-focused for now.
+
 ## Main Workflow
 
 Generate a target manifest from the synth's built-in presets:

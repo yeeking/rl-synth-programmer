@@ -299,6 +299,177 @@ class SynthHost:
         return path
 
 
+class RenderKingSynthHost:
+    """Opt-in RenderKing VST3 host adapter matching SynthHost's public API."""
+
+    RESERVED_PARAMETER_TOKENS = SynthHost.RESERVED_PARAMETER_TOKENS
+
+    def __init__(self, config: SynthHostConfig):
+        self.config = config
+        self._host: Any | None = None
+        self._parameter_specs: list[ParameterSpec] | None = None
+
+    @property
+    def host(self) -> Any:
+        if self._host is None:
+            self.load()
+        assert self._host is not None
+        return self._host
+
+    def _module(self):
+        try:
+            from . import _renderking
+        except ImportError as exc:
+            raise RuntimeError(
+                "RenderKing backend requested but rl_synth_programmer._renderking is not importable. "
+                "Install native build dependencies with '.venv/bin/pip install -e .[native]' and build "
+                "native/renderking with CMake before using --host-backend renderking."
+            ) from exc
+        return _renderking
+
+    def load(self) -> Any:
+        module = self._module()
+        self.ensure_plugin_path()
+        self._host = module.Host(
+            str(self.config.plugin_path),
+            sample_rate=int(self.config.sample_rate),
+            block_size=int(self.config.block_size),
+            render_duration=float(self.config.render_duration),
+            tail_duration=float(self.config.tail_duration),
+            warmup_duration=float(self.config.warmup_duration),
+            note=int(self.config.note),
+            velocity=int(self.config.velocity),
+        )
+        self._parameter_specs = self._build_parameter_specs()
+        return self._host
+
+    def inspect_plugin(self) -> dict[str, Any]:
+        payload = dict(self.host.inspect_plugin())
+        payload["supports_preset_data"] = True
+        payload["supports_raw_state"] = True
+        return payload
+
+    def _build_parameter_specs(self) -> list[ParameterSpec]:
+        specs: list[ParameterSpec] = []
+        for item in self.host.list_parameters():
+            specs.append(
+                ParameterSpec(
+                    stable_id=str(item["stable_id"]),
+                    display_name=str(item["display_name"]),
+                    index=int(item["index"]),
+                    default_value=float(item["default_value"]),
+                    minimum=float(item.get("minimum", 0.0)),
+                    maximum=float(item.get("maximum", 1.0)),
+                    automatable=bool(item.get("automatable", True)),
+                    is_meta=bool(item.get("is_meta", False)),
+                )
+            )
+        return specs
+
+    def list_parameters(self) -> list[ParameterSpec]:
+        if self._parameter_specs is None:
+            self.load()
+        assert self._parameter_specs is not None
+        return list(self._parameter_specs)
+
+    def list_program_controls(self) -> dict[str, Any] | None:
+        return None
+
+    def filter_parameters(
+        self,
+        allowlist: list[str] | None = None,
+        denylist: list[str] | None = None,
+    ) -> list[ParameterSpec]:
+        allowset = set(allowlist or [])
+        denyset = set(denylist or [])
+        filtered: list[ParameterSpec] = []
+        for spec in self.list_parameters():
+            stable_lower = spec.stable_id.lower()
+            display_lower = spec.display_name.lower()
+            if allowset and spec.stable_id not in allowset:
+                continue
+            if spec.stable_id in denyset:
+                continue
+            if not spec.automatable or spec.is_meta:
+                continue
+            if any(token in stable_lower or token in display_lower for token in self.RESERVED_PARAMETER_TOKENS):
+                continue
+            filtered.append(spec)
+        assert filtered, "Parameter filtering produced an empty parameter set."
+        return filtered
+
+    def get_normalized_defaults(self, parameter_specs: list[ParameterSpec]) -> dict[str, float]:
+        return {spec.stable_id: spec.normalize(spec.default_value) for spec in parameter_specs}
+
+    def set_parameters(self, normalized_values: dict[str, float], parameter_specs: list[ParameterSpec] | None = None) -> None:
+        _ = parameter_specs
+        self.host.set_parameters({str(key): float(value) for key, value in normalized_values.items()})
+
+    def capture_preset_state(self) -> bytes:
+        return bytes(self.host.capture_preset_state())
+
+    def restore_preset_state(self, state: bytes) -> None:
+        self.host.restore_preset_state(bytes(state))
+
+    def select_program(self, index: int | str) -> None:
+        assert isinstance(index, int), "RenderKing program selection currently requires an integer program index."
+        self.host.select_program(int(index))
+
+    def current_parameter_snapshot(self, parameter_specs: list[ParameterSpec] | None = None) -> dict[str, float]:
+        snapshot = {str(key): float(value) for key, value in self.host.current_parameter_snapshot().items()}
+        if parameter_specs is None:
+            return snapshot
+        return {spec.stable_id: snapshot[spec.stable_id] for spec in parameter_specs}
+
+    def enumerate_program_states(self, max_programs: int | None = None) -> list[dict[str, Any]]:
+        states = []
+        for item in self.host.enumerate_program_states(max_programs):
+            state = dict(item)
+            state_bytes = bytes(state["state_bytes"])
+            state_hash = sha1(state_bytes).hexdigest()
+            state["state_bytes"] = state_bytes
+            state["state_hash"] = state_hash
+            if str(state.get("target_id", "")).startswith("state-default"):
+                state["target_id"] = f"state-{state_hash[:12]}"
+            elif str(state.get("target_id", "")).startswith("program-"):
+                program_index = int(state["program_index"])
+                state["target_id"] = f"program-{program_index:03d}-{state_hash[:8]}"
+            states.append(state)
+        return states
+
+    def render_note(
+        self,
+        parameter_values: dict[str, float] | None = None,
+        note: int | None = None,
+        duration: float | None = None,
+        velocity: int | None = None,
+    ) -> np.ndarray:
+        audio = self.host.render_note(
+            None if parameter_values is None else {str(key): float(value) for key, value in parameter_values.items()},
+            note,
+            duration,
+            velocity,
+        )
+        audio = np.asarray(audio, dtype=np.float32)
+        assert audio.ndim == 1, f"Expected mono audio, got shape {audio.shape}."
+        return audio
+
+    def ensure_plugin_path(self) -> Path:
+        path = Path(self.config.plugin_path)
+        assert path.exists(), f"Plugin path does not exist: {path}"
+        assert path.suffix.lower() == ".vst3", f"Expected a .vst3 plugin path, got: {path}"
+        return path
+
+
+def make_synth_host(config: SynthHostConfig):
+    backend = str(getattr(config, "host_backend", "pedalboard"))
+    if backend == "pedalboard":
+        return SynthHost(config)
+    if backend == "renderking":
+        return RenderKingSynthHost(config)
+    raise ValueError(f"Unsupported synth host backend: {backend}")
+
+
 def nudge_parameter_values(
     parameters: dict[str, float],
     parameter_specs: list[ParameterSpec],

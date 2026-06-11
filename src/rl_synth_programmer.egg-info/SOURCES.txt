@@ -31,5 +31,6 @@ tests/test_curriculum.py
 tests/test_env.py
 tests/test_host.py
 tests/test_offline_dataset.py
+tests/test_renderking.py
 tests/test_reward.py
 tests/test_training.py

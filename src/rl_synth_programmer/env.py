@@ -8,7 +8,7 @@ import numpy as np
 
 from .config import CurriculumConfig, RewardConfig, SynthEnvConfig
 from .curriculum import TargetPool, TargetSpec
-from .host import ParameterSpec, SynthHost, nudge_parameter_values
+from .host import ParameterSpec, make_synth_host, nudge_parameter_values
 from .reward import AudioEmbedder, RandomRewardModel, SimilarityRewardModel, build_embedder
 
 try:
@@ -241,5 +241,5 @@ class SynthProgrammingEnv(gym.Env):
 
 
 def make_env(config: SynthEnvConfig, curriculum_config: CurriculumConfig) -> SynthProgrammingEnv:
-    host = SynthHost(config.host)
+    host = make_synth_host(config.host)
     return SynthProgrammingEnv(config, curriculum_config, host)

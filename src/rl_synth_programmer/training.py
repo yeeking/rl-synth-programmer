@@ -9,7 +9,7 @@ import numpy as np
 from .agent import DQNAgent, RandomAgent, ReplayTransition
 from .config import ExperimentConfig
 from .env import SynthProgrammingEnv, make_env
-from .host import SynthHost, nudge_parameter_values
+from .host import RenderKingSynthHost, SynthHost, nudge_parameter_values
 from .logging_utils import create_summary_writer, log_run_metadata, make_progress_bar, stage_log
 from .optional_deps import require_dependency
 from .parallel_rollout import (
@@ -20,6 +20,12 @@ from .parallel_rollout import (
     embed_audio_batch,
 )
 from .reward import build_embedder
+
+
+def make_synth_host(config):
+    if str(getattr(config, "host_backend", "pedalboard")) == "renderking":
+        return RenderKingSynthHost(config)
+    return SynthHost(config)
 
 
 @dataclass(slots=True)
@@ -382,7 +388,7 @@ def train_dqn_batched(
     assert config.updates_per_tick >= 1, f"updates_per_tick must be >= 1, got {config.updates_per_tick}"
     assert config.clap_batch_size >= 1, f"clap_batch_size must be >= 1, got {config.clap_batch_size}"
     stage_log("Loading coordinator host for parameter discovery.")
-    probe_host = SynthHost(config.env.host)
+    probe_host = make_synth_host(config.env.host)
     parameter_specs = probe_host.filter_parameters(
         allowlist=config.env.parameter_allowlist,
         denylist=config.env.parameter_denylist,

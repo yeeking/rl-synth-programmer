@@ -89,6 +89,7 @@ class CliLoggingOptionsTest(unittest.TestCase):
         self.assertEqual(args.num_workers, 1)
         self.assertEqual(args.clap_batch_size, 8)
         self.assertEqual(args.clap_device, "auto")
+        self.assertEqual(args.host_backend, "pedalboard")
         self.assertFalse(args.estimate_only)
         self.assertFalse(args.confirm_large_run)
         self.assertEqual(args.render_timeout_seconds, 300.0)
@@ -126,6 +127,21 @@ class CliLoggingOptionsTest(unittest.TestCase):
         self.assertEqual(args.rows_to_generate, 12)
         self.assertEqual(args.moves_per_cycle, 3)
         self.assertTrue(args.confirm_large_run)
+
+    def test_generate_action_dataset_parser_accepts_renderking_backend(self) -> None:
+        parser = _base_parser()
+        args = parser.parse_args(
+            [
+                "generate-action-dataset",
+                "--plugin",
+                "/tmp/test.vst3",
+                "--run-folder",
+                "artifacts/test_run",
+                "--host-backend",
+                "renderking",
+            ]
+        )
+        self.assertEqual(args.host_backend, "renderking")
 
     def test_compare_architectures_parser_defaults(self) -> None:
         parser = _base_parser()
